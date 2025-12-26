@@ -1,0 +1,5 @@
+.envrc
+*~
+create-ec2
+delete-ec2
+build
