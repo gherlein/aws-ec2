@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -27,7 +28,7 @@ type StackInfo struct {
 
 const cloudFormationTemplate = `
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Lowest cost x86 EC2 instance (t2.nano) with SSH access
+Description: Lowest cost x86 EC2 instance with SSH access
 
 Parameters:
   LatestAmiId:
@@ -107,27 +108,64 @@ Outputs:
 `
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <github-username>", os.Args[0])
-	}
-	githubUsername := os.Args[1]
+	createCmd := flag.Bool("create", false, "Create a new EC2 instance")
+	createShort := flag.Bool("c", false, "Create a new EC2 instance (shorthand)")
+	deleteCmd := flag.Bool("delete", false, "Delete an existing stack")
+	deleteShort := flag.Bool("d", false, "Delete an existing stack (shorthand)")
+	stackName := flag.String("name", "ec2-instance", "Stack name")
+	stackNameShort := flag.String("n", "", "Stack name (shorthand)")
 
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <github-username>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -c -n mystack gherlein    Create stack 'mystack' with GitHub user 'gherlein'\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -d -n mystack             Delete stack 'mystack'\n", os.Args[0])
+	}
+
+	flag.Parse()
+
+	doCreate := *createCmd || *createShort
+	doDelete := *deleteCmd || *deleteShort
+
+	if *stackNameShort != "" {
+		*stackName = *stackNameShort
+	}
+
+	if !doCreate && !doDelete {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if doCreate && doDelete {
+		log.Fatal("Cannot specify both --create and --delete")
+	}
+
+	if doCreate {
+		if flag.NArg() < 1 {
+			log.Fatal("GitHub username required for create")
+		}
+		createStack(*stackName, flag.Arg(0))
+	} else if doDelete {
+		deleteStack(*stackName)
+	}
+}
+
+func createStack(stackName, githubUsername string) {
 	ctx := context.Background()
 
-	// Load AWS config from environment (AWS_REGION, credentials)
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
 	fmt.Printf("Using AWS Region: %s\n", cfg.Region)
+	fmt.Printf("Stack Name: %s\n", stackName)
 	fmt.Printf("GitHub Username: %s\n", githubUsername)
 
 	client := cloudformation.NewFromConfig(cfg)
 
-	stackName := "lowest-cost-x86-instance"
-
-	// Create the CloudFormation stack
 	input := &cloudformation.CreateStackInput{
 		StackName:    &stackName,
 		TemplateBody: stringPtr(cloudFormationTemplate),
@@ -157,7 +195,6 @@ func main() {
 	fmt.Printf("Stack ID: %s\n", *result.StackId)
 	fmt.Printf("Waiting for stack to complete...\n")
 
-	// Wait for stack creation to complete
 	waiter := cloudformation.NewStackCreateCompleteWaiter(client)
 	err = waiter.Wait(ctx, &cloudformation.DescribeStacksInput{
 		StackName: &stackName,
@@ -166,7 +203,6 @@ func main() {
 		log.Fatalf("failed waiting for stack: %v", err)
 	}
 
-	// Get stack outputs
 	describeOutput, err := client.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
 		StackName: &stackName,
 	})
@@ -174,7 +210,6 @@ func main() {
 		log.Fatalf("failed to describe stack: %v", err)
 	}
 
-	// Build stack info
 	info := StackInfo{
 		StackName:      stackName,
 		StackID:        *result.StackId,
@@ -197,13 +232,12 @@ func main() {
 		}
 	}
 
-	// Write to JSON file
 	jsonData, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
 		log.Fatalf("failed to marshal JSON: %v", err)
 	}
 
-	filename := "stack-info.json"
+	filename := fmt.Sprintf("%s.json", stackName)
 	err = os.WriteFile(filename, jsonData, 0644)
 	if err != nil {
 		log.Fatalf("failed to write file: %v", err)
@@ -212,6 +246,43 @@ func main() {
 	fmt.Printf("\n=== Stack Created Successfully ===\n")
 	fmt.Println(string(jsonData))
 	fmt.Printf("\nStack info written to %s\n", filename)
+}
+
+func deleteStack(stackName string) {
+	ctx := context.Background()
+
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatalf("failed to load AWS config: %v", err)
+	}
+
+	fmt.Printf("Using AWS Region: %s\n", cfg.Region)
+	fmt.Printf("Deleting Stack: %s\n", stackName)
+
+	client := cloudformation.NewFromConfig(cfg)
+
+	_, err = client.DeleteStack(ctx, &cloudformation.DeleteStackInput{
+		StackName: &stackName,
+	})
+	if err != nil {
+		log.Fatalf("failed to delete stack: %v", err)
+	}
+
+	fmt.Println("Stack deletion initiated, waiting for completion...")
+
+	waiter := cloudformation.NewStackDeleteCompleteWaiter(client)
+	err = waiter.Wait(ctx, &cloudformation.DescribeStacksInput{
+		StackName: &stackName,
+	}, 10*time.Minute)
+	if err != nil {
+		log.Fatalf("failed waiting for stack deletion: %v", err)
+	}
+
+	// Remove the JSON file if it exists
+	filename := fmt.Sprintf("%s.json", stackName)
+	os.Remove(filename)
+
+	fmt.Println("Stack deleted successfully")
 }
 
 func stringPtr(s string) *string {
