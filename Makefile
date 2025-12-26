@@ -1,11 +1,12 @@
 .PHONY: build clean status
 
 build:
-	go build -o create-ec2 main.go
-	go build -o delete-ec2 delete.go
+	mkdir -p bin
+	go build -o bin/create-ec2 main.go
+	go build -o bin/delete-ec2 delete.go
 
 clean:
-	rm -f create-ec2 delete-ec2
+	rm -rf bin
 
 status:
 	aws cloudformation describe-stack-events --stack-name lowest-cost-x86-instance --region $(AWS_REGION)
