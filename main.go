@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,18 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 )
+
+type StackInfo struct {
+	StackName      string `json:"stack_name"`
+	StackID        string `json:"stack_id"`
+	Region         string `json:"region"`
+	GitHubUsername string `json:"github_username"`
+	InstanceID     string `json:"instance_id"`
+	InstanceType   string `json:"instance_type"`
+	PublicIP       string `json:"public_ip"`
+	SecurityGroup  string `json:"security_group"`
+	SSHCommand     string `json:"ssh_command"`
+}
 
 const cloudFormationTemplate = `
 AWSTemplateFormatVersion: '2010-09-09'
@@ -161,10 +174,44 @@ func main() {
 		log.Fatalf("failed to describe stack: %v", err)
 	}
 
-	fmt.Printf("\n=== Stack Created Successfully ===\n")
-	for _, output := range describeOutput.Stacks[0].Outputs {
-		fmt.Printf("%s: %s\n", *output.OutputKey, *output.OutputValue)
+	// Build stack info
+	info := StackInfo{
+		StackName:      stackName,
+		StackID:        *result.StackId,
+		Region:         cfg.Region,
+		GitHubUsername: githubUsername,
 	}
+
+	for _, output := range describeOutput.Stacks[0].Outputs {
+		switch *output.OutputKey {
+		case "InstanceId":
+			info.InstanceID = *output.OutputValue
+		case "InstanceType":
+			info.InstanceType = *output.OutputValue
+		case "PublicIP":
+			info.PublicIP = *output.OutputValue
+		case "SecurityGroupId":
+			info.SecurityGroup = *output.OutputValue
+		case "SSHCommand":
+			info.SSHCommand = *output.OutputValue
+		}
+	}
+
+	// Write to JSON file
+	jsonData, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		log.Fatalf("failed to marshal JSON: %v", err)
+	}
+
+	filename := "stack-info.json"
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		log.Fatalf("failed to write file: %v", err)
+	}
+
+	fmt.Printf("\n=== Stack Created Successfully ===\n")
+	fmt.Println(string(jsonData))
+	fmt.Printf("\nStack info written to %s\n", filename)
 }
 
 func stringPtr(s string) *string {
