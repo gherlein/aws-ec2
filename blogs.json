@@ -1,0 +1,11 @@
+{
+  "stack_name": "blogs",
+  "stack_id": "arn:aws:cloudformation:us-west-2:064348451250:stack/blogs/f4e80080-e31c-11f0-b1a2-02b2107735b5",
+  "region": "us-west-2",
+  "github_username": "gherlein",
+  "instance_id": "i-0c8672ce6751a2029",
+  "instance_type": "t3.micro",
+  "public_ip": "44.248.6.204",
+  "security_group": "blogs-SSHSecurityGroup-yubQZrujjWjq",
+  "ssh_command": "ssh gherlein@44.248.6.204"
+}
