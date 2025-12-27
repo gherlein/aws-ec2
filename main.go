@@ -176,16 +176,30 @@ func main() {
 	}
 }
 
-func readConfig(stackName string) (*StackConfig, error) {
-	filename := fmt.Sprintf("%s.json", stackName)
+func resolveConfigPath(stackName string) string {
+	// First, check if ./stacks/<stackName>.json exists
+	stacksPath := fmt.Sprintf("stacks/%s.json", stackName)
+	if _, err := os.Stat(stacksPath); err == nil {
+		return stacksPath
+	}
+
+	// Otherwise, treat stackName as a path (with or without .json)
+	if strings.HasSuffix(stackName, ".json") {
+		return stackName
+	}
+	return fmt.Sprintf("%s.json", stackName)
+}
+
+func readConfig(stackName string) (*StackConfig, string, error) {
+	filename := resolveConfigPath(stackName)
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file %s: %w", filename, err)
+		return nil, filename, fmt.Errorf("failed to read config file %s: %w", filename, err)
 	}
 
 	var cfg StackConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, filename, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
 	// Set defaults
@@ -196,11 +210,10 @@ func readConfig(stackName string) (*StackConfig, error) {
 		cfg.TTL = 300
 	}
 
-	return &cfg, nil
+	return &cfg, filename, nil
 }
 
-func writeConfig(stackName string, cfg *StackConfig) error {
-	filename := fmt.Sprintf("%s.json", stackName)
+func writeConfig(filename string, cfg *StackConfig) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -294,9 +307,9 @@ func createStack(stackName string) {
 	ctx := context.Background()
 
 	// Read config
-	stackCfg, err := readConfig(stackName)
+	stackCfg, configFile, err := readConfig(stackName)
 	if err != nil {
-		log.Fatalf("Error: %v\n\nCreate a config file %s.json with:\n%s", err, stackName, `{
+		log.Fatalf("Error: %v\n\nCreate a config file stacks/%s.json with:\n%s", err, stackName, `{
   "github_username": "your-github-username",
   "instance_type": "t3.micro",
   "hostname": "dev",
@@ -315,6 +328,7 @@ func createStack(stackName string) {
 	}
 
 	fmt.Printf("Using AWS Region: %s\n", awsCfg.Region)
+	fmt.Printf("Config File: %s\n", configFile)
 	fmt.Printf("Stack Name: %s\n", stackName)
 	fmt.Printf("GitHub Username: %s\n", stackCfg.GitHubUsername)
 	fmt.Printf("Instance Type: %s\n", stackCfg.InstanceType)
@@ -420,14 +434,14 @@ func createStack(stackName string) {
 	}
 
 	// Write updated config
-	if err := writeConfig(stackName, stackCfg); err != nil {
+	if err := writeConfig(configFile, stackCfg); err != nil {
 		log.Printf("Warning: failed to write config: %v", err)
 	}
 
 	fmt.Printf("\n=== Stack Created Successfully ===\n")
 	jsonData, _ := json.MarshalIndent(stackCfg, "", "  ")
 	fmt.Println(string(jsonData))
-	fmt.Printf("\nConfig updated: %s.json\n", stackName)
+	fmt.Printf("\nConfig updated: %s\n", configFile)
 	fmt.Printf("SSH: %s\n", stackCfg.SSHCommand)
 }
 
@@ -435,10 +449,11 @@ func deleteStack(stackName string) {
 	ctx := context.Background()
 
 	// Try to read config for DNS cleanup
-	stackCfg, err := readConfig(stackName)
+	stackCfg, configFile, err := readConfig(stackName)
 	if err != nil {
 		fmt.Printf("Warning: could not read config file: %v\n", err)
 		stackCfg = nil
+		configFile = ""
 	}
 
 	// Load AWS config
