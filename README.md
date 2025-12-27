@@ -110,17 +110,17 @@ The binary will be placed in `./bin/ec2`.
 
 ## Quick Start
 
-### 1. Create the stacks directory and copy the example config
+### 1. Create a stack folder with config
 
 ```bash
-mkdir -p stacks
-cp example.json stacks/myserver.json
+mkdir -p stacks/myserver
+cp example.json stacks/myserver/stack.json
 ```
 
 ### 2. Edit the config
 
 ```bash
-vi stacks/myserver.json
+vi stacks/myserver/stack.json
 ```
 
 Set your GitHub username and optionally configure DNS:
@@ -141,7 +141,7 @@ Set your GitHub username and optionally configure DNS:
 ./bin/ec2 -c -n myserver
 ```
 
-The tool automatically looks for `stacks/myserver.json` first. If not found, it treats the name as a path.
+The tool automatically looks for `stacks/myserver/stack.json`. If not found, it treats the name as a direct path to a JSON file.
 
 ### 4. Connect via SSH
 
@@ -157,9 +157,18 @@ ssh your-github-username@myserver.example.com
 
 ## Configuration
 
-Stack configuration files should be stored in the `./stacks/` directory. The tool automatically looks for `stacks/<name>.json` first, then falls back to treating the name as a direct path.
+Each stack is a folder under `./stacks/` containing a `stack.json` configuration file and any additional files (like cloud-init scripts). The tool looks for `stacks/<name>/stack.json` first, then falls back to treating the name as a direct path.
 
-### Config File Structure
+### Stack Folder Structure
+
+```
+stacks/myserver/
+├── stack.json       # Stack configuration (required)
+├── init.sh          # Cloud-init script (optional, referenced in stack.json)
+└── other-files...   # Additional files referenced by init script
+```
+
+### Config File Structure (stack.json)
 
 ```json
 {
@@ -189,7 +198,7 @@ Stack configuration files should be stored in the `./stacks/` directory. The too
 | `hostname` | No | - | DNS hostname without domain (e.g., `dev`). Required if using DNS |
 | `domain` | No | - | Domain name for Route53 (e.g., `example.com`). Required if using DNS |
 | `ttl` | No | `300` | DNS record TTL in seconds |
-| `cloudinit_script` | No | - | Path to custom cloud-init script (relative to stacks/ directory) |
+| `cloudinit_script` | No | - | Path to custom cloud-init script (relative to stack folder) |
 | `ports` | No | `22` | Comma-separated list of TCP ports to open (e.g., `22,80,443`) |
 | `base_image` | No | Amazon Linux 2023 | SSM parameter path or AMI ID. See [supported-images.md](supported-images.md) |
 
@@ -229,7 +238,7 @@ Options:
 ```
 
 This command:
-1. Looks for `stacks/<stackname>.json` (or uses the name as a path if not found)
+1. Looks for `stacks/<stackname>/stack.json` (or uses the name as a direct path if not found)
 2. Validates required fields (`github_username`)
 3. Looks up Route53 hosted zone (if `domain` specified)
 4. Creates CloudFormation stack with:
@@ -323,11 +332,19 @@ The config file is updated with instance details:
 
 ## Custom Cloud-Init Scripts
 
-You can provide a custom cloud-init script instead of the default one. Create a shell script in the `stacks/` directory and reference it in your config:
+You can provide a custom cloud-init script instead of the default one. Place the script in your stack folder and reference it in `stack.json`:
 
 ### Example
 
-1. Create a custom script `stacks/my-init.sh`:
+1. Create a stack folder with a custom script:
+
+```
+stacks/myserver/
+├── stack.json
+└── init.sh
+```
+
+2. Create the init script `stacks/myserver/init.sh`:
 
 ```bash
 #!/bin/bash
@@ -355,17 +372,17 @@ systemctl start docker
 usermod -aG docker $GITHUB_USER
 ```
 
-2. Reference it in your config `stacks/myserver.json`:
+3. Reference it in `stacks/myserver/stack.json`:
 
 ```json
 {
   "github_username": "gherlein",
   "instance_type": "t3.micro",
-  "cloudinit_script": "my-init.sh"
+  "cloudinit_script": "init.sh"
 }
 ```
 
-The script path is relative to the `stacks/` directory or the directory containing the config file.
+The script path is relative to the stack folder containing `stack.json`.
 
 ## Free Tier Instance Types
 
@@ -468,18 +485,20 @@ Or in the AWS console: CloudFormation → Stacks → Select stack → Events tab
 ```
 .
 ├── bin/
-│   └── ec2              # Compiled binary
-├── stacks/              # Stack configuration files (gitignored)
-│   └── myserver.json    # Example stack config
-├── example.json         # Example configuration template
-├── main.go              # Source code
-├── go.mod               # Go module definition
-├── go.sum               # Go dependencies
-├── Makefile             # Build automation
-├── supported-images.md  # List of supported base images
-├── plan.md              # Implementation plan
-├── .gitignore           # Git ignore file
-└── README.md            # This file
+│   └── ec2                  # Compiled binary
+├── stacks/                  # Stack folders (gitignored)
+│   └── myserver/            # Example stack
+│       ├── stack.json       # Stack configuration
+│       ├── init.sh          # Cloud-init script (optional)
+│       └── ...              # Other files (optional)
+├── example.json             # Example configuration template
+├── main.go                  # Source code
+├── go.mod                   # Go module definition
+├── go.sum                   # Go dependencies
+├── Makefile                 # Build automation
+├── supported-images.md      # List of supported base images
+├── .gitignore               # Git ignore file
+└── README.md                # This file
 ```
 
 ## License

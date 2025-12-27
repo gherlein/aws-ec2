@@ -23,14 +23,15 @@ import (
 
 type StackConfig struct {
 	// Input fields (user provides)
-	GitHubUsername  string `json:"github_username"`
-	InstanceType    string `json:"instance_type,omitempty"`
-	Hostname        string `json:"hostname,omitempty"`
-	Domain          string `json:"domain,omitempty"`
-	TTL             int    `json:"ttl,omitempty"`
-	CloudInitScript string `json:"cloudinit_script,omitempty"`
-	Ports           string `json:"ports,omitempty"`     // Comma-separated list of ports (e.g., "22,80,443")
-	BaseImage       string `json:"base_image,omitempty"` // SSM parameter path or AMI ID
+	GitHubUsername  string   `json:"github_username"`
+	InstanceType    string   `json:"instance_type,omitempty"`
+	Hostname        string   `json:"hostname,omitempty"`
+	Domain          string   `json:"domain,omitempty"`
+	TTL             int      `json:"ttl,omitempty"`
+	CloudInitScript string   `json:"cloudinit_script,omitempty"`
+	Ports           string   `json:"ports,omitempty"`      // Comma-separated list of ports (e.g., "22,80,443")
+	BaseImage       string   `json:"base_image,omitempty"` // SSM parameter path or AMI ID
+	CNAMEs          []string `json:"cnames,omitempty"`     // Additional hostnames as CNAMEs pointing to main hostname
 
 	// Output fields (program fills in)
 	StackName     string `json:"stack_name,omitempty"`
@@ -142,17 +143,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s -c -n mystack    Create stack using stacks/mystack.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -c -n mystack    Create stack using stacks/mystack/stack.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -d -n mystack    Delete stack 'mystack'\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nThe tool looks for stacks/<name>.json first, then treats name as a path.\n")
-		fmt.Fprintf(os.Stderr, "\nConfig file format (stacks/mystack.json):\n")
-		fmt.Fprintf(os.Stderr, `  {
-    "github_username": "gherlein",
-    "instance_type": "t3.micro",
-    "hostname": "dev",
-    "domain": "example.com",
-    "ttl": 300
-  }
+		fmt.Fprintf(os.Stderr, "\nThe tool looks for stacks/<name>/stack.json first, then treats name as a path.\n")
+		fmt.Fprintf(os.Stderr, "\nStack folder structure (stacks/mystack/):\n")
+		fmt.Fprintf(os.Stderr, `  stacks/mystack/
+    ├── stack.json       # Stack configuration (required)
+    ├── init.sh          # Cloud-init script (optional)
+    └── other-files...   # Additional files referenced by init script
 `)
 	}
 
@@ -187,10 +185,10 @@ func main() {
 }
 
 func resolveConfigPath(stackName string) string {
-	// First, check if ./stacks/<stackName>.json exists
-	stacksPath := fmt.Sprintf("stacks/%s.json", stackName)
-	if _, err := os.Stat(stacksPath); err == nil {
-		return stacksPath
+	// First, check if ./stacks/<stackName>/stack.json exists (folder-based)
+	folderPath := fmt.Sprintf("stacks/%s/stack.json", stackName)
+	if _, err := os.Stat(folderPath); err == nil {
+		return folderPath
 	}
 
 	// Otherwise, treat stackName as a path (with or without .json)
@@ -284,18 +282,13 @@ func getUserDataScript(cfg *StackConfig, configFile string) (string, error) {
 	var script string
 
 	if cfg.CloudInitScript != "" {
-		// Look for the cloudinit script relative to the config file
+		// Look for the cloudinit script relative to the config file (in the stack folder)
 		configDir := filepath.Dir(configFile)
 		scriptPath := filepath.Join(configDir, cfg.CloudInitScript)
 
-		// Also check stacks/ directory
-		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-			scriptPath = filepath.Join("stacks", cfg.CloudInitScript)
-		}
-
 		data, err := os.ReadFile(scriptPath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read cloudinit script %s: %w", cfg.CloudInitScript, err)
+			return "", fmt.Errorf("failed to read cloudinit script %s: %w", scriptPath, err)
 		}
 		script = string(data)
 		fmt.Printf("Using custom cloudinit script: %s\n", scriptPath)
@@ -389,18 +382,81 @@ func deleteDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqd
 	return err
 }
 
+func createCNAMERecord(ctx context.Context, r53Client *route53.Client, zoneID, cname, target string, ttl int) error {
+	if !strings.HasSuffix(cname, ".") {
+		cname = cname + "."
+	}
+	if !strings.HasSuffix(target, ".") {
+		target = target + "."
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(zoneID),
+		ChangeBatch: &r53types.ChangeBatch{
+			Changes: []r53types.Change{
+				{
+					Action: r53types.ChangeActionUpsert,
+					ResourceRecordSet: &r53types.ResourceRecordSet{
+						Name: aws.String(cname),
+						Type: r53types.RRTypeCname,
+						TTL:  aws.Int64(int64(ttl)),
+						ResourceRecords: []r53types.ResourceRecord{
+							{Value: aws.String(target)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := r53Client.ChangeResourceRecordSets(ctx, input)
+	return err
+}
+
+func deleteCNAMERecord(ctx context.Context, r53Client *route53.Client, zoneID, cname, target string, ttl int) error {
+	if !strings.HasSuffix(cname, ".") {
+		cname = cname + "."
+	}
+	if !strings.HasSuffix(target, ".") {
+		target = target + "."
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(zoneID),
+		ChangeBatch: &r53types.ChangeBatch{
+			Changes: []r53types.Change{
+				{
+					Action: r53types.ChangeActionDelete,
+					ResourceRecordSet: &r53types.ResourceRecordSet{
+						Name: aws.String(cname),
+						Type: r53types.RRTypeCname,
+						TTL:  aws.Int64(int64(ttl)),
+						ResourceRecords: []r53types.ResourceRecord{
+							{Value: aws.String(target)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := r53Client.ChangeResourceRecordSets(ctx, input)
+	return err
+}
+
 func createStack(stackName string) {
 	ctx := context.Background()
 
 	// Read config
 	stackCfg, configFile, err := readConfig(stackName)
 	if err != nil {
-		log.Fatalf("Error: %v\n\nCreate a config file stacks/%s.json with:\n%s", err, stackName, `{
+		log.Fatalf("Error: %v\n\nCreate a stack folder stacks/%s/ with stack.json:\n\nmkdir -p stacks/%s\ncat > stacks/%s/stack.json << 'EOF'\n%sEOF", err, stackName, stackName, stackName, `{
   "github_username": "your-github-username",
   "instance_type": "t3.micro",
   "hostname": "dev",
   "domain": "example.com"
-}`)
+}
+`)
 	}
 
 	if stackCfg.GitHubUsername == "" {
@@ -545,6 +601,18 @@ func createStack(stackName string) {
 			stackCfg.ZoneID = zoneID
 			stackCfg.FQDN = fqdn
 			stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.GitHubUsername, fqdn)
+
+			// Create CNAME records if configured
+			for _, cname := range stackCfg.CNAMEs {
+				cnameFQDN := fmt.Sprintf("%s.%s", cname, stackCfg.Domain)
+				fmt.Printf("Creating CNAME record: %s -> %s\n", cnameFQDN, fqdn)
+				err = createCNAMERecord(ctx, r53Client, zoneID, cnameFQDN, fqdn, stackCfg.TTL)
+				if err != nil {
+					log.Printf("Warning: failed to create CNAME record %s: %v", cnameFQDN, err)
+				} else {
+					fmt.Printf("CNAME record created: %s\n", cnameFQDN)
+				}
+			}
 		}
 	} else {
 		stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.GitHubUsername, stackCfg.PublicIP)
@@ -584,10 +652,24 @@ func deleteStack(stackName string) {
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
 
-	// Delete DNS record if it was configured
+	// Delete DNS records if configured
 	if stackCfg != nil && stackCfg.ZoneID != "" && stackCfg.FQDN != "" && stackCfg.PublicIP != "" {
-		fmt.Printf("Deleting DNS record: %s\n", stackCfg.FQDN)
 		r53Client := route53.NewFromConfig(awsCfg)
+
+		// Delete CNAME records first (they depend on the A record)
+		for _, cname := range stackCfg.CNAMEs {
+			cnameFQDN := fmt.Sprintf("%s.%s", cname, stackCfg.Domain)
+			fmt.Printf("Deleting CNAME record: %s\n", cnameFQDN)
+			err = deleteCNAMERecord(ctx, r53Client, stackCfg.ZoneID, cnameFQDN, stackCfg.FQDN, stackCfg.TTL)
+			if err != nil {
+				log.Printf("Warning: failed to delete CNAME record %s: %v", cnameFQDN, err)
+			} else {
+				fmt.Printf("CNAME record deleted: %s\n", cnameFQDN)
+			}
+		}
+
+		// Delete the main A record
+		fmt.Printf("Deleting DNS record: %s\n", stackCfg.FQDN)
 		err = deleteDNSRecord(ctx, r53Client, stackCfg.ZoneID, stackCfg.FQDN, stackCfg.PublicIP, stackCfg.TTL)
 		if err != nil {
 			log.Printf("Warning: failed to delete DNS record: %v", err)
