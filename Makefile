@@ -6,6 +6,7 @@ build:
 
 clean:
 	rm -rf bin
+	rm -f *~
 
 status:
 	aws cloudformation describe-stack-events --stack-name $(STACK_NAME) --region $(AWS_REGION)

@@ -1,5 +1,11 @@
-.envrc
+# Binaries
+bin/
+
+# Stack configurations (may contain sensitive info)
+stacks/
+
+# Editor backup files
 *~
-create-ec2
-delete-ec2
-bin
+
+# OS files
+.DS_Store

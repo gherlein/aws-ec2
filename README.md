@@ -1,38 +1,93 @@
 # EC2 Instance Manager
 
-A CLI tool to create and manage EC2 instances on AWS using CloudFormation, with optional Route53 DNS integration.
+A Go CLI tool to create and manage EC2 instances on AWS using CloudFormation, with optional Route53 DNS integration. Designed for quick provisioning of development or temporary instances with automatic SSH key setup from GitHub.
 
 ## Features
 
-- Creates EC2 instances using CloudFormation
-- Automatically fetches SSH public keys from GitHub for passwordless login
-- Creates a Linux user matching your GitHub username with sudo access
-- Optional Route53 DNS record creation (A record)
-- Configurable instance type
-- JSON config files for easy stack management
+- **One-command provisioning**: Create a fully configured EC2 instance with a single command
+- **GitHub SSH keys**: Automatically fetches your public SSH keys from GitHub
+- **User creation**: Creates a Linux user matching your GitHub username with passwordless sudo
+- **Route53 DNS**: Optionally creates an A record pointing to your instance
+- **CloudFormation**: Uses CloudFormation for reliable, repeatable infrastructure
+- **JSON config**: Simple JSON configuration files for each stack
+- **Clean teardown**: Deletes DNS records and CloudFormation stack, clears config
 
 ## Prerequisites
 
-- Go 1.21+
-- AWS CLI configured or environment variables set:
-  - `AWS_REGION`
-  - `AWS_ACCESS_KEY_ID`
-  - `AWS_SECRET_ACCESS_KEY`
+### Go
 
-### Required IAM Permissions
+Go 1.21 or later is required to build the tool.
+
+### AWS Credentials
+
+Set up AWS credentials using one of these methods:
+
+1. **Environment variables** (recommended for scripts):
+   ```bash
+   export AWS_REGION=us-west-2
+   export AWS_ACCESS_KEY_ID=your-access-key
+   export AWS_SECRET_ACCESS_KEY=your-secret-key
+   ```
+
+2. **AWS credentials file** (`~/.aws/credentials`):
+   ```ini
+   [default]
+   aws_access_key_id = your-access-key
+   aws_secret_access_key = your-secret-key
+   ```
+
+3. **AWS config file** (`~/.aws/config`):
+   ```ini
+   [default]
+   region = us-west-2
+   ```
+
+### IAM Permissions
+
+Your AWS user/role needs the following permissions:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "CloudFormation",
       "Effect": "Allow",
       "Action": [
         "cloudformation:CreateStack",
         "cloudformation:DeleteStack",
         "cloudformation:DescribeStacks",
-        "cloudformation:DescribeStackEvents",
-        "ec2:*",
+        "cloudformation:DescribeStackEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EC2",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:DescribeInstances",
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:DescribeSecurityGroups",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SSM",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:*:*:parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "Route53",
+      "Effect": "Allow",
+      "Action": [
         "route53:ListHostedZonesByName",
         "route53:ChangeResourceRecordSets",
         "route53:GetHostedZone"
@@ -46,16 +101,63 @@ A CLI tool to create and manage EC2 instances on AWS using CloudFormation, with 
 ## Installation
 
 ```bash
+git clone <repository>
+cd aws
 make build
 ```
 
 The binary will be placed in `./bin/ec2`.
 
-## Usage
+## Quick Start
 
-### 1. Create a config file
+### 1. Create the stacks directory and copy the example config
 
-Create `<stackname>.json` with your configuration:
+```bash
+mkdir -p stacks
+cp example.json stacks/myserver.json
+```
+
+### 2. Edit the config
+
+```bash
+vi stacks/myserver.json
+```
+
+Set your GitHub username and optionally configure DNS:
+
+```json
+{
+  "github_username": "your-github-username",
+  "instance_type": "t3.micro",
+  "hostname": "myserver",
+  "domain": "example.com",
+  "ttl": 300
+}
+```
+
+### 3. Create the instance
+
+```bash
+./bin/ec2 -c -n stacks/myserver
+```
+
+### 4. Connect via SSH
+
+```bash
+ssh your-github-username@myserver.example.com
+```
+
+### 5. Delete when done
+
+```bash
+./bin/ec2 -d -n stacks/myserver
+```
+
+## Configuration
+
+Stack configuration files should be stored in the `./stacks/` directory. Each stack uses a JSON configuration file named `<stackname>.json`.
+
+### Config File Structure
 
 ```json
 {
@@ -63,53 +165,46 @@ Create `<stackname>.json` with your configuration:
   "instance_type": "t3.micro",
   "hostname": "dev",
   "domain": "example.com",
-  "ttl": 300
+  "ttl": 300,
+  "stack_name": "",
+  "stack_id": "",
+  "region": "",
+  "instance_id": "",
+  "public_ip": "",
+  "security_group": "",
+  "zone_id": "",
+  "fqdn": "",
+  "ssh_command": ""
 }
 ```
 
-#### Config Fields
+### Input Fields (You Configure)
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `github_username` | Yes | - | GitHub username for SSH key fetch |
-| `instance_type` | No | `t3.micro` | EC2 instance type |
-| `hostname` | No | - | DNS hostname (without domain) |
-| `domain` | No | - | Domain name for Route53 lookup |
+| `github_username` | **Yes** | - | Your GitHub username. SSH keys are fetched from `https://github.com/<username>.keys` |
+| `instance_type` | No | `t3.micro` | EC2 instance type. See [Free Tier Types](#free-tier-instance-types) |
+| `hostname` | No | - | DNS hostname without domain (e.g., `dev`). Required if using DNS |
+| `domain` | No | - | Domain name for Route53 (e.g., `example.com`). Required if using DNS |
 | `ttl` | No | `300` | DNS record TTL in seconds |
 
-### 2. Create the stack
+### Output Fields (Auto-Filled)
 
-```bash
-./bin/ec2 -c -n mystack
-```
+These fields are empty in a new config and are populated when the stack is created:
 
-This will:
-1. Read `mystack.json` for configuration
-2. Look up the Route53 hosted zone for the domain (if specified)
-3. Create a CloudFormation stack
-4. Wait for the EC2 instance to be ready
-5. Create a DNS A record (if hostname and domain are specified)
-6. Update `mystack.json` with instance details
+| Field | Description |
+|-------|-------------|
+| `stack_name` | CloudFormation stack name |
+| `stack_id` | CloudFormation stack ARN |
+| `region` | AWS region where the stack was created |
+| `instance_id` | EC2 instance ID (e.g., `i-0abc123def456`) |
+| `public_ip` | Public IPv4 address of the instance |
+| `security_group` | Security group ID |
+| `zone_id` | Route53 hosted zone ID (if DNS configured) |
+| `fqdn` | Fully qualified domain name (if DNS configured) |
+| `ssh_command` | Ready-to-use SSH command |
 
-### 3. Connect via SSH
-
-```bash
-ssh gherlein@dev.example.com
-# or
-ssh gherlein@<public-ip>
-```
-
-### 4. Delete the stack
-
-```bash
-./bin/ec2 -d -n mystack
-```
-
-This will:
-1. Read `mystack.json` for DNS cleanup info
-2. Delete the Route53 A record (if it was created)
-3. Delete the CloudFormation stack
-4. Wait for deletion to complete
+When you delete a stack, these output fields are cleared back to empty strings.
 
 ## Command Reference
 
@@ -120,113 +215,221 @@ Options:
   -c, --create    Create a new EC2 instance
   -d, --delete    Delete an existing stack
   -n, --name      Stack name (required)
-
-Examples:
-  ./bin/ec2 -c -n mystack    Create stack using mystack.json config
-  ./bin/ec2 -d -n mystack    Delete stack 'mystack'
 ```
 
-## Example Workflow
-
-### Create config file
+### Create a Stack
 
 ```bash
-cat > dev-server.json << 'EOF'
+./bin/ec2 -c -n stacks/<stackname>
+```
+
+This command:
+1. Reads `stacks/<stackname>.json` for configuration
+2. Validates required fields (`github_username`)
+3. Looks up Route53 hosted zone (if `domain` specified)
+4. Creates CloudFormation stack with:
+   - EC2 instance with specified instance type
+   - Security group allowing SSH (port 22) from anywhere
+   - UserData script that creates your user and installs SSH keys
+5. Waits for stack creation to complete
+6. Creates DNS A record (if `hostname` and `domain` specified)
+7. Updates `stacks/<stackname>.json` with instance details
+
+### Delete a Stack
+
+```bash
+./bin/ec2 -d -n stacks/<stackname>
+```
+
+This command:
+1. Reads `stacks/<stackname>.json` for cleanup info
+2. Deletes Route53 A record (if it was created)
+3. Deletes CloudFormation stack (terminates EC2, deletes security group)
+4. Waits for deletion to complete
+5. Clears output fields in `stacks/<stackname>.json`
+
+## Examples
+
+### Basic Usage (No DNS)
+
+```json
+{
+  "github_username": "gherlein",
+  "instance_type": "t3.micro"
+}
+```
+
+```bash
+./bin/ec2 -c -n stacks/devbox
+# Connect using IP from output
+ssh gherlein@54.184.71.168
+```
+
+### With DNS
+
+```json
 {
   "github_username": "gherlein",
   "instance_type": "t3.micro",
   "hostname": "dev",
   "domain": "example.com"
 }
-EOF
 ```
-
-### Create the instance
 
 ```bash
-./bin/ec2 -c -n dev-server
+./bin/ec2 -c -n stacks/devbox
+# Connect using hostname
+ssh gherlein@dev.example.com
 ```
 
-Output:
-```
-Using AWS Region: us-west-2
-Stack Name: dev-server
-GitHub Username: gherlein
-Instance Type: t3.micro
-Looking up zone ID for example.com...
-Found Zone ID: Z1234567890ABC
-Stack creation initiated!
-Waiting for stack to complete...
-Creating DNS record: dev.example.com -> 54.184.71.168
-DNS record created successfully
+### Larger Instance
 
-=== Stack Created Successfully ===
+```json
+{
+  "github_username": "gherlein",
+  "instance_type": "t3.large",
+  "hostname": "build",
+  "domain": "example.com"
+}
+```
+
+### After Creation
+
+The config file is updated with instance details:
+
+```json
 {
   "github_username": "gherlein",
   "instance_type": "t3.micro",
   "hostname": "dev",
   "domain": "example.com",
   "ttl": 300,
-  "stack_name": "dev-server",
-  "stack_id": "arn:aws:cloudformation:us-west-2:...",
+  "stack_name": "devbox",
+  "stack_id": "arn:aws:cloudformation:us-west-2:123456789:stack/devbox/abc123",
   "region": "us-west-2",
-  "instance_id": "i-0abc123def456",
+  "instance_id": "i-0abc123def456789",
   "public_ip": "54.184.71.168",
-  "security_group": "dev-server-SSHSecurityGroup-xxx",
+  "security_group": "devbox-SSHSecurityGroup-XYZ123",
   "zone_id": "Z1234567890ABC",
   "fqdn": "dev.example.com",
   "ssh_command": "ssh gherlein@dev.example.com"
 }
-
-Config updated: dev-server.json
-SSH: ssh gherlein@dev.example.com
-```
-
-### Connect
-
-```bash
-ssh gherlein@dev.example.com
-```
-
-### Delete when done
-
-```bash
-./bin/ec2 -d -n dev-server
-```
-
-## Check Stack Status
-
-```bash
-STACK_NAME=dev-server make status
-```
-
-## Cleanup Build Artifacts
-
-```bash
-make clean
 ```
 
 ## Free Tier Instance Types
 
-The following x86 instance types are free-tier eligible:
-- `t3.micro` (default)
-- `t3.small`
-- `c7i-flex.large`
-- `m7i-flex.large`
+The following x86 instance types are free-tier eligible (750 hours/month for 12 months):
+
+| Instance Type | vCPUs | Memory | Notes |
+|--------------|-------|--------|-------|
+| `t3.micro` | 2 | 1 GB | **Default**, general purpose |
+| `t3.small` | 2 | 2 GB | More memory |
+| `c7i-flex.large` | 2 | 4 GB | Compute optimized |
+| `m7i-flex.large` | 2 | 8 GB | General purpose, more memory |
+
+**Note**: Free tier eligibility depends on your AWS account status. Accounts created after a certain date may have different restrictions.
+
+## Makefile Targets
+
+```bash
+make build    # Build the binary to ./bin/ec2
+make clean    # Remove the bin directory
+make status   # Check CloudFormation stack events (requires STACK_NAME env var)
+```
+
+### Check Stack Status
+
+```bash
+STACK_NAME=myserver make status
+```
+
+## How It Works
+
+### Instance Provisioning
+
+1. **AMI Selection**: Uses the latest Amazon Linux 2023 x86_64 AMI via SSM parameter lookup
+2. **Security Group**: Creates a security group allowing inbound SSH (port 22) from `0.0.0.0/0`
+3. **UserData Script**: Runs on first boot to:
+   - Create a Linux user matching your GitHub username
+   - Grant passwordless sudo access
+   - Fetch SSH public keys from `https://github.com/<username>.keys`
+   - Configure SSH authorized_keys
+
+### DNS Integration
+
+If `hostname` and `domain` are specified:
+1. Looks up the Route53 hosted zone ID for the domain
+2. Creates an A record: `<hostname>.<domain>` → `<public_ip>`
+3. On deletion, removes the A record before deleting the stack
 
 ## Troubleshooting
 
 ### "hosted zone not found for domain"
 
-Ensure the domain exists in Route53 as a hosted zone. You can check with:
+The domain must exist as a hosted zone in Route53. Check your hosted zones:
+
 ```bash
-aws route53 list-hosted-zones
+aws route53 list-hosted-zones --query 'HostedZones[*].[Name,Id]' --output table
 ```
 
 ### "instance type is not eligible for Free Tier"
 
-Use a free-tier eligible instance type. See the list above.
+Your AWS account may have restrictions. Use a free-tier eligible type:
+- `t3.micro`
+- `t3.small`
+- `c7i-flex.large`
+- `m7i-flex.large`
 
 ### SSH connection refused
 
-Wait 1-2 minutes after stack creation for cloud-init to complete user setup.
+The UserData script takes 1-2 minutes to complete after the instance starts. Wait and try again.
+
+Check cloud-init status by connecting via EC2 Instance Connect in the AWS console, then:
+
+```bash
+sudo cat /var/log/cloud-init-output.log
+```
+
+### Stack creation failed
+
+Check the CloudFormation events:
+
+```bash
+STACK_NAME=myserver make status
+```
+
+Or in the AWS console: CloudFormation → Stacks → Select stack → Events tab
+
+### Permission denied (publickey)
+
+1. Ensure your GitHub account has public SSH keys: `https://github.com/<username>.keys`
+2. Make sure you're using the correct username (matches `github_username` in config)
+3. Wait for cloud-init to complete (1-2 minutes after instance starts)
+
+## Security Considerations
+
+- **SSH Access**: The security group allows SSH from `0.0.0.0/0` (anywhere). For production, consider restricting to specific IP ranges.
+- **Sudo Access**: The created user has passwordless sudo. This is convenient for development but may not be appropriate for all use cases.
+- **Public Keys**: SSH keys are fetched from GitHub over HTTPS. Ensure your GitHub account security is adequate.
+
+## Files
+
+```
+.
+├── bin/
+│   └── ec2              # Compiled binary
+├── stacks/              # Stack configuration files (gitignored)
+│   └── myserver.json    # Example stack config
+├── example.json         # Example configuration template
+├── main.go              # Source code
+├── go.mod               # Go module definition
+├── go.sum               # Go dependencies
+├── Makefile             # Build automation
+├── plan.md              # Implementation plan
+├── .gitignore           # Git ignore file
+└── README.md            # This file
+```
+
+## License
+
+MIT
