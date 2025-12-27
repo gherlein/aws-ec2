@@ -1,0 +1,11 @@
+Using AWS Region: us-west-2
+Config File: stacks/blogs.json
+Stack Name: blogs
+GitHub Username: gherlein
+Instance Type: t3.micro
+Base Image: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+AMI ID: ami-0786adace1541ca80
+Using custom cloudinit script: stacks/blogs.sh
+Looking up zone ID for herlein.com...
+Found Zone ID: Z1BH53QHTY1W11
+Ports: 22,80,443

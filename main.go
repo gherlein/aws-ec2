@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,15 +18,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 type StackConfig struct {
 	// Input fields (user provides)
-	GitHubUsername string `json:"github_username"`
-	InstanceType   string `json:"instance_type,omitempty"`
-	Hostname       string `json:"hostname,omitempty"`
-	Domain         string `json:"domain,omitempty"`
-	TTL            int    `json:"ttl,omitempty"`
+	GitHubUsername  string `json:"github_username"`
+	InstanceType    string `json:"instance_type,omitempty"`
+	Hostname        string `json:"hostname,omitempty"`
+	Domain          string `json:"domain,omitempty"`
+	TTL             int    `json:"ttl,omitempty"`
+	CloudInitScript string `json:"cloudinit_script,omitempty"`
+	Ports           string `json:"ports,omitempty"`     // Comma-separated list of ports (e.g., "22,80,443")
+	BaseImage       string `json:"base_image,omitempty"` // SSM parameter path or AMI ID
 
 	// Output fields (program fills in)
 	StackName     string `json:"stack_name,omitempty"`
@@ -38,14 +44,17 @@ type StackConfig struct {
 	SSHCommand    string `json:"ssh_command,omitempty"`
 }
 
-const cloudFormationTemplate = `
+// Default AMI - Amazon Linux 2023 x86_64
+const defaultBaseImage = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+const cloudFormationTemplateHeader = `
 AWSTemplateFormatVersion: '2010-09-09'
 Description: EC2 instance with SSH access
 
 Parameters:
-  LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AmiId:
+    Type: String
+    Description: AMI ID for the EC2 instance
   GitHubUsername:
     Type: String
     Description: GitHub username to fetch SSH public keys from
@@ -55,52 +64,26 @@ Parameters:
     Default: t3.micro
 
 Resources:
-  SSHSecurityGroup:
+  SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH inbound traffic
+      GroupDescription: Security group with configured ports
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
+`
+
+const cloudFormationTemplateFooter = `
       Tags:
         - Key: Name
-          Value: SSHAccess
+          Value: !Sub "${AWS::StackName}-sg"
 
   EC2Instance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
-      ImageId: !Ref LatestAmiId
+      ImageId: !Ref AmiId
       SecurityGroupIds:
-        - !GetAtt SSHSecurityGroup.GroupId
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          set -e
-
-          GITHUB_USER="${GitHubUsername}"
-
-          # Create user with sudo access
-          useradd -m -s /bin/bash $GITHUB_USER
-          echo "$GITHUB_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$GITHUB_USER
-
-          # Setup SSH directory
-          SSH_DIR="/home/$GITHUB_USER/.ssh"
-          AUTH_KEYS="$SSH_DIR/authorized_keys"
-
-          mkdir -p $SSH_DIR
-          chmod 700 $SSH_DIR
-
-          # Download public keys from GitHub
-          curl -s "https://github.com/${GitHubUsername}.keys" > $AUTH_KEYS
-
-          # Set correct permissions
-          chmod 600 $AUTH_KEYS
-          chown -R $GITHUB_USER:$GITHUB_USER $SSH_DIR
-
-          echo "User $GITHUB_USER created with SSH keys from GitHub"
+        - !GetAtt SecurityGroup.GroupId
+      UserData: %s
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
@@ -117,7 +100,33 @@ Outputs:
     Value: !Ref InstanceType
   SecurityGroupId:
     Description: Security Group ID
-    Value: !Ref SSHSecurityGroup
+    Value: !Ref SecurityGroup
+`
+
+const defaultCloudInitTemplate = `#!/bin/bash
+set -e
+
+GITHUB_USER="%s"
+
+# Create user with sudo access
+useradd -m -s /bin/bash $GITHUB_USER
+echo "$GITHUB_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$GITHUB_USER
+
+# Setup SSH directory
+SSH_DIR="/home/$GITHUB_USER/.ssh"
+AUTH_KEYS="$SSH_DIR/authorized_keys"
+
+mkdir -p $SSH_DIR
+chmod 700 $SSH_DIR
+
+# Download public keys from GitHub
+curl -s "https://github.com/$GITHUB_USER.keys" > $AUTH_KEYS
+
+# Set correct permissions
+chmod 600 $AUTH_KEYS
+chown -R $GITHUB_USER:$GITHUB_USER $SSH_DIR
+
+echo "User $GITHUB_USER created with SSH keys from GitHub"
 `
 
 func main() {
@@ -220,6 +229,82 @@ func writeConfig(filename string, cfg *StackConfig) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+func resolveAmiId(ctx context.Context, ssmClient *ssm.Client, baseImage string) (string, error) {
+	// If it starts with "ami-", it's already an AMI ID
+	if strings.HasPrefix(baseImage, "ami-") {
+		return baseImage, nil
+	}
+
+	// Otherwise, treat it as an SSM parameter path
+	input := &ssm.GetParameterInput{
+		Name: aws.String(baseImage),
+	}
+
+	result, err := ssmClient.GetParameter(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("failed to get SSM parameter %s: %w", baseImage, err)
+	}
+
+	return *result.Parameter.Value, nil
+}
+
+func generateCloudFormationTemplate(ports string, userDataScript string) string {
+	// Parse ports, default to just SSH (22)
+	portList := []string{"22"}
+	if ports != "" {
+		portList = []string{}
+		for _, p := range strings.Split(ports, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				portList = append(portList, p)
+			}
+		}
+	}
+
+	// Generate security group ingress rules
+	var ingressRules strings.Builder
+	for _, port := range portList {
+		ingressRules.WriteString(fmt.Sprintf(`        - IpProtocol: tcp
+          FromPort: %s
+          ToPort: %s
+          CidrIp: 0.0.0.0/0
+`, port, port))
+	}
+
+	// Embed UserData directly in template (base64 encoded)
+	userDataBase64 := base64.StdEncoding.EncodeToString([]byte(userDataScript))
+	footer := fmt.Sprintf(cloudFormationTemplateFooter, userDataBase64)
+
+	return cloudFormationTemplateHeader + ingressRules.String() + footer
+}
+
+func getUserDataScript(cfg *StackConfig, configFile string) (string, error) {
+	var script string
+
+	if cfg.CloudInitScript != "" {
+		// Look for the cloudinit script relative to the config file
+		configDir := filepath.Dir(configFile)
+		scriptPath := filepath.Join(configDir, cfg.CloudInitScript)
+
+		// Also check stacks/ directory
+		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+			scriptPath = filepath.Join("stacks", cfg.CloudInitScript)
+		}
+
+		data, err := os.ReadFile(scriptPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read cloudinit script %s: %w", cfg.CloudInitScript, err)
+		}
+		script = string(data)
+		fmt.Printf("Using custom cloudinit script: %s\n", scriptPath)
+	} else {
+		// Use default template
+		script = fmt.Sprintf(defaultCloudInitTemplate, cfg.GitHubUsername)
+	}
+
+	return script, nil
 }
 
 func lookupZoneID(ctx context.Context, r53Client *route53.Client, domain string) (string, error) {
@@ -336,6 +421,25 @@ func createStack(stackName string) {
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
 	r53Client := route53.NewFromConfig(awsCfg)
+	ssmClient := ssm.NewFromConfig(awsCfg)
+
+	// Resolve base image
+	baseImage := stackCfg.BaseImage
+	if baseImage == "" {
+		baseImage = defaultBaseImage
+	}
+	amiId, err := resolveAmiId(ctx, ssmClient, baseImage)
+	if err != nil {
+		log.Fatalf("failed to resolve AMI: %v", err)
+	}
+	fmt.Printf("Base Image: %s\n", baseImage)
+	fmt.Printf("AMI ID: %s\n", amiId)
+
+	// Get UserData script (custom or default)
+	userDataScript, err := getUserDataScript(stackCfg, configFile)
+	if err != nil {
+		log.Fatalf("failed to get user data script: %v", err)
+	}
 
 	// Lookup zone ID if domain is specified
 	var zoneID string
@@ -350,11 +454,23 @@ func createStack(stackName string) {
 		fqdn = fmt.Sprintf("%s.%s", stackCfg.Hostname, stackCfg.Domain)
 	}
 
+	// Generate CloudFormation template with configured ports and embedded UserData
+	cfTemplate := generateCloudFormationTemplate(stackCfg.Ports, userDataScript)
+	if stackCfg.Ports != "" {
+		fmt.Printf("Ports: %s\n", stackCfg.Ports)
+	} else {
+		fmt.Printf("Ports: 22 (default)\n")
+	}
+
 	// Create CloudFormation stack
 	input := &cloudformation.CreateStackInput{
 		StackName:    &stackName,
-		TemplateBody: aws.String(cloudFormationTemplate),
+		TemplateBody: aws.String(cfTemplate),
 		Parameters: []types.Parameter{
+			{
+				ParameterKey:   aws.String("AmiId"),
+				ParameterValue: aws.String(amiId),
+			},
 			{
 				ParameterKey:   aws.String("GitHubUsername"),
 				ParameterValue: aws.String(stackCfg.GitHubUsername),

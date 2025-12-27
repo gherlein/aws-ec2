@@ -189,6 +189,9 @@ Stack configuration files should be stored in the `./stacks/` directory. The too
 | `hostname` | No | - | DNS hostname without domain (e.g., `dev`). Required if using DNS |
 | `domain` | No | - | Domain name for Route53 (e.g., `example.com`). Required if using DNS |
 | `ttl` | No | `300` | DNS record TTL in seconds |
+| `cloudinit_script` | No | - | Path to custom cloud-init script (relative to stacks/ directory) |
+| `ports` | No | `22` | Comma-separated list of TCP ports to open (e.g., `22,80,443`) |
+| `base_image` | No | Amazon Linux 2023 | SSM parameter path or AMI ID. See [supported-images.md](supported-images.md) |
 
 ### Output Fields (Auto-Filled)
 
@@ -318,6 +321,52 @@ The config file is updated with instance details:
 }
 ```
 
+## Custom Cloud-Init Scripts
+
+You can provide a custom cloud-init script instead of the default one. Create a shell script in the `stacks/` directory and reference it in your config:
+
+### Example
+
+1. Create a custom script `stacks/my-init.sh`:
+
+```bash
+#!/bin/bash
+set -e
+
+# Your custom initialization
+GITHUB_USER="gherlein"
+
+# Create user with sudo access
+useradd -m -s /bin/bash $GITHUB_USER
+echo "$GITHUB_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$GITHUB_USER
+
+# Setup SSH
+SSH_DIR="/home/$GITHUB_USER/.ssh"
+mkdir -p $SSH_DIR
+chmod 700 $SSH_DIR
+curl -s "https://github.com/$GITHUB_USER.keys" > $SSH_DIR/authorized_keys
+chmod 600 $SSH_DIR/authorized_keys
+chown -R $GITHUB_USER:$GITHUB_USER $SSH_DIR
+
+# Install additional packages
+dnf install -y docker git
+systemctl enable docker
+systemctl start docker
+usermod -aG docker $GITHUB_USER
+```
+
+2. Reference it in your config `stacks/myserver.json`:
+
+```json
+{
+  "github_username": "gherlein",
+  "instance_type": "t3.micro",
+  "cloudinit_script": "my-init.sh"
+}
+```
+
+The script path is relative to the `stacks/` directory or the directory containing the config file.
+
 ## Free Tier Instance Types
 
 The following x86 instance types are free-tier eligible (750 hours/month for 12 months):
@@ -349,8 +398,8 @@ STACK_NAME=myserver make status
 
 ### Instance Provisioning
 
-1. **AMI Selection**: Uses the latest Amazon Linux 2023 x86_64 AMI via SSM parameter lookup
-2. **Security Group**: Creates a security group allowing inbound SSH (port 22) from `0.0.0.0/0`
+1. **AMI Selection**: Uses `base_image` if specified (SSM parameter path or AMI ID), otherwise defaults to Amazon Linux 2023 x86_64. See [supported-images.md](supported-images.md) for available options.
+2. **Security Group**: Creates a security group allowing inbound traffic on configured ports (default: SSH port 22) from `0.0.0.0/0`
 3. **UserData Script**: Runs on first boot to:
    - Create a Linux user matching your GitHub username
    - Grant passwordless sudo access
@@ -427,6 +476,7 @@ Or in the AWS console: CloudFormation → Stacks → Select stack → Events tab
 ├── go.mod               # Go module definition
 ├── go.sum               # Go dependencies
 ├── Makefile             # Build automation
+├── supported-images.md  # List of supported base images
 ├── plan.md              # Implementation plan
 ├── .gitignore           # Git ignore file
 └── README.md            # This file
