@@ -138,8 +138,10 @@ Set your GitHub username and optionally configure DNS:
 ### 3. Create the instance
 
 ```bash
-./bin/ec2 -c -n stacks/myserver
+./bin/ec2 -c -n myserver
 ```
+
+The tool automatically looks for `stacks/myserver.json` first. If not found, it treats the name as a path.
 
 ### 4. Connect via SSH
 
@@ -150,12 +152,12 @@ ssh your-github-username@myserver.example.com
 ### 5. Delete when done
 
 ```bash
-./bin/ec2 -d -n stacks/myserver
+./bin/ec2 -d -n myserver
 ```
 
 ## Configuration
 
-Stack configuration files should be stored in the `./stacks/` directory. Each stack uses a JSON configuration file named `<stackname>.json`.
+Stack configuration files should be stored in the `./stacks/` directory. The tool automatically looks for `stacks/<name>.json` first, then falls back to treating the name as a direct path.
 
 ### Config File Structure
 
@@ -220,11 +222,11 @@ Options:
 ### Create a Stack
 
 ```bash
-./bin/ec2 -c -n stacks/<stackname>
+./bin/ec2 -c -n <stackname>
 ```
 
 This command:
-1. Reads `stacks/<stackname>.json` for configuration
+1. Looks for `stacks/<stackname>.json` (or uses the name as a path if not found)
 2. Validates required fields (`github_username`)
 3. Looks up Route53 hosted zone (if `domain` specified)
 4. Creates CloudFormation stack with:
@@ -233,20 +235,20 @@ This command:
    - UserData script that creates your user and installs SSH keys
 5. Waits for stack creation to complete
 6. Creates DNS A record (if `hostname` and `domain` specified)
-7. Updates `stacks/<stackname>.json` with instance details
+7. Updates the config file with instance details
 
 ### Delete a Stack
 
 ```bash
-./bin/ec2 -d -n stacks/<stackname>
+./bin/ec2 -d -n <stackname>
 ```
 
 This command:
-1. Reads `stacks/<stackname>.json` for cleanup info
+1. Reads the config file for cleanup info
 2. Deletes Route53 A record (if it was created)
 3. Deletes CloudFormation stack (terminates EC2, deletes security group)
 4. Waits for deletion to complete
-5. Clears output fields in `stacks/<stackname>.json`
+5. Clears deployment-specific fields in the config file
 
 ## Examples
 
@@ -260,7 +262,7 @@ This command:
 ```
 
 ```bash
-./bin/ec2 -c -n stacks/devbox
+./bin/ec2 -c -n devbox
 # Connect using IP from output
 ssh gherlein@54.184.71.168
 ```
@@ -277,7 +279,7 @@ ssh gherlein@54.184.71.168
 ```
 
 ```bash
-./bin/ec2 -c -n stacks/devbox
+./bin/ec2 -c -n devbox
 # Connect using hostname
 ssh gherlein@dev.example.com
 ```

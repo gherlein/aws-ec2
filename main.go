@@ -133,9 +133,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s -c -n mystack    Create stack using mystack.json config\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -c -n mystack    Create stack using stacks/mystack.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -d -n mystack    Delete stack 'mystack'\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nConfig file format (mystack.json):\n")
+		fmt.Fprintf(os.Stderr, "\nThe tool looks for stacks/<name>.json first, then treats name as a path.\n")
+		fmt.Fprintf(os.Stderr, "\nConfig file format (stacks/mystack.json):\n")
 		fmt.Fprintf(os.Stderr, `  {
     "github_username": "gherlein",
     "instance_type": "t3.micro",
@@ -498,7 +499,7 @@ func deleteStack(stackName string) {
 	}
 
 	// Clear output fields in config file
-	if stackCfg != nil {
+	if stackCfg != nil && configFile != "" {
 		stackCfg.StackName = ""
 		stackCfg.StackID = ""
 		stackCfg.Region = ""
@@ -508,10 +509,10 @@ func deleteStack(stackName string) {
 		stackCfg.ZoneID = ""
 		stackCfg.FQDN = ""
 		stackCfg.SSHCommand = ""
-		if err := writeConfig(stackName, stackCfg); err != nil {
+		if err := writeConfig(configFile, stackCfg); err != nil {
 			log.Printf("Warning: failed to update config file: %v", err)
 		} else {
-			fmt.Printf("Config cleared: %s.json\n", stackName)
+			fmt.Printf("Config cleared: %s\n", configFile)
 		}
 	}
 
