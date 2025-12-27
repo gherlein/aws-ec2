@@ -1,8 +1,8 @@
 {
-  "github_username": "gherlein",
+  "github_username": "your-github-username",
   "instance_type": "t3.micro",
-  "hostname": "blogs",
-  "domain": "yourdomainhere.com",
+  "hostname": "dev",
+  "domain": "example.com",
   "ttl": 300,
   "stack_name": "",
   "stack_id": "",
