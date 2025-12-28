@@ -1,0 +1,3 @@
+aws route53 list-resource-record-sets --hosted-zone-id Z1BH53QHTY1W11 --query
+  "ResourceRecordSets[?Name=='greg.herlein.com.' || Name=='luca.herlein.com.' ||
+  Name=='blogs.herlein.com.']"
