@@ -1,20 +1,24 @@
 {
   "users": [
     {
-      "username": "admin",
-      "github_username": "your-github-username"
+      "username": "greg",
+      "github_username": "gherlein"
     },
     {
-      "username": "developer",
-      "github_username": "another-github-username"
+      "username": "alice",
+      "github_username": "alice-dev"
+    },
+    {
+      "username": "bob",
+      "github_username": "bob-admin"
     }
   ],
   "instance_type": "t3.micro",
-  "hostname": "dev",
+  "hostname": "app",
   "domain": "example.com",
   "ttl": 300,
-  "is_apex_domain": false,
-  "cname_aliases": ["api", "staging"],
+  "is_apex_domain": true,
+  "cname_aliases": ["api", "staging", "web"],
   "stack_name": "",
   "stack_id": "",
   "region": "",

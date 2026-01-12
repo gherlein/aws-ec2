@@ -4,6 +4,9 @@ bin/
 # Stack configurations (may contain sensitive info)
 stacks/
 
+# local stuff
+local
+
 # Editor backup files
 *~
 

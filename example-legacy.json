@@ -1,0 +1,16 @@
+{
+  "github_username": "your-github-username",
+  "instance_type": "t3.micro",
+  "hostname": "dev",
+  "domain": "example.com",
+  "ttl": 300,
+  "stack_name": "",
+  "stack_id": "",
+  "region": "",
+  "instance_id": "",
+  "public_ip": "",
+  "security_group": "",
+  "zone_id": "",
+  "fqdn": "",
+  "ssh_command": ""
+}

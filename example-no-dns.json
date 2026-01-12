@@ -6,15 +6,10 @@
     },
     {
       "username": "developer",
-      "github_username": "another-github-username"
+      "github_username": "dev-github-username"
     }
   ],
   "instance_type": "t3.micro",
-  "hostname": "dev",
-  "domain": "example.com",
-  "ttl": 300,
-  "is_apex_domain": false,
-  "cname_aliases": ["api", "staging"],
   "stack_name": "",
   "stack_id": "",
   "region": "",

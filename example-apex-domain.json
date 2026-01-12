@@ -3,18 +3,13 @@
     {
       "username": "admin",
       "github_username": "your-github-username"
-    },
-    {
-      "username": "developer",
-      "github_username": "another-github-username"
     }
   ],
   "instance_type": "t3.micro",
-  "hostname": "dev",
+  "hostname": "www",
   "domain": "example.com",
   "ttl": 300,
-  "is_apex_domain": false,
-  "cname_aliases": ["api", "staging"],
+  "is_apex_domain": true,
   "stack_name": "",
   "stack_id": "",
   "region": "",

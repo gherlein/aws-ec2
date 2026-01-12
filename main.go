@@ -18,24 +18,40 @@ import (
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 )
 
+type User struct {
+	Username       string `json:"username"`
+	GitHubUsername string `json:"github_username"`
+}
+
+type DNSRecord struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Value string `json:"value"`
+	TTL   int    `json:"ttl"`
+}
+
 type StackConfig struct {
 	// Input fields (user provides)
-	GitHubUsername string `json:"github_username"`
-	InstanceType   string `json:"instance_type,omitempty"`
-	Hostname       string `json:"hostname,omitempty"`
-	Domain         string `json:"domain,omitempty"`
-	TTL            int    `json:"ttl,omitempty"`
+	GitHubUsername string   `json:"github_username,omitempty"`
+	Users          []User   `json:"users,omitempty"`
+	InstanceType   string   `json:"instance_type,omitempty"`
+	Hostname       string   `json:"hostname,omitempty"`
+	Domain         string   `json:"domain,omitempty"`
+	TTL            int      `json:"ttl,omitempty"`
+	IsApexDomain   bool     `json:"is_apex_domain,omitempty"`
+	CNAMEAliases   []string `json:"cname_aliases,omitempty"`
 
 	// Output fields (program fills in)
-	StackName     string `json:"stack_name,omitempty"`
-	StackID       string `json:"stack_id,omitempty"`
-	Region        string `json:"region,omitempty"`
-	InstanceID    string `json:"instance_id,omitempty"`
-	PublicIP      string `json:"public_ip,omitempty"`
-	SecurityGroup string `json:"security_group,omitempty"`
-	ZoneID        string `json:"zone_id,omitempty"`
-	FQDN          string `json:"fqdn,omitempty"`
-	SSHCommand    string `json:"ssh_command,omitempty"`
+	StackName     string      `json:"stack_name,omitempty"`
+	StackID       string      `json:"stack_id,omitempty"`
+	Region        string      `json:"region,omitempty"`
+	InstanceID    string      `json:"instance_id,omitempty"`
+	PublicIP      string      `json:"public_ip,omitempty"`
+	SecurityGroup string      `json:"security_group,omitempty"`
+	ZoneID        string      `json:"zone_id,omitempty"`
+	FQDN          string      `json:"fqdn,omitempty"`
+	SSHCommand    string      `json:"ssh_command,omitempty"`
+	DNSRecords    []DNSRecord `json:"dns_records,omitempty"`
 }
 
 const cloudFormationTemplate = `
@@ -46,9 +62,9 @@ Parameters:
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-  GitHubUsername:
+  Users:
     Type: String
-    Description: GitHub username to fetch SSH public keys from
+    Description: Comma-separated list of username:github_username pairs
   InstanceType:
     Type: String
     Description: EC2 instance type
@@ -80,27 +96,37 @@ Resources:
           #!/bin/bash
           set -e
 
-          GITHUB_USER="${GitHubUsername}"
+          # Users parameter format: username1:github1,username2:github2
+          USERS="${Users}"
 
-          # Create user with sudo access
-          useradd -m -s /bin/bash $GITHUB_USER
-          echo "$GITHUB_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$GITHUB_USER
+          # Split by comma and process each user
+          IFS=',' read -ra USER_ARRAY <<< "$USERS"
+          for user_spec in "$${USER_ARRAY[@]}"; do
+            # Split by colon to get username and github_username
+            IFS=':' read -r USERNAME GITHUB_USER <<< "$user_spec"
 
-          # Setup SSH directory
-          SSH_DIR="/home/$GITHUB_USER/.ssh"
-          AUTH_KEYS="$SSH_DIR/authorized_keys"
+            echo "Creating user: $USERNAME (GitHub: $GITHUB_USER)"
 
-          mkdir -p $SSH_DIR
-          chmod 700 $SSH_DIR
+            # Create user with sudo access
+            useradd -m -s /bin/bash "$USERNAME"
+            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
 
-          # Download public keys from GitHub
-          curl -s "https://github.com/${GitHubUsername}.keys" > $AUTH_KEYS
+            # Setup SSH directory
+            SSH_DIR="/home/$USERNAME/.ssh"
+            AUTH_KEYS="$SSH_DIR/authorized_keys"
 
-          # Set correct permissions
-          chmod 600 $AUTH_KEYS
-          chown -R $GITHUB_USER:$GITHUB_USER $SSH_DIR
+            mkdir -p "$SSH_DIR"
+            chmod 700 "$SSH_DIR"
 
-          echo "User $GITHUB_USER created with SSH keys from GitHub"
+            # Download public keys from GitHub
+            curl -s "https://github.com/$GITHUB_USER.keys" > "$AUTH_KEYS"
+
+            # Set correct permissions
+            chmod 600 "$AUTH_KEYS"
+            chown -R "$USERNAME:$USERNAME" "$SSH_DIR"
+
+            echo "User $USERNAME created with SSH keys from GitHub ($GITHUB_USER)"
+          done
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
@@ -248,9 +274,109 @@ func lookupZoneID(ctx context.Context, r53Client *route53.Client, domain string)
 	return "", fmt.Errorf("hosted zone not found for domain: %s", domain)
 }
 
-func createDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqdn, ip string, ttl int) error {
-	if !strings.HasSuffix(fqdn, ".") {
-		fqdn = fqdn + "."
+func validateUserConfig(cfg *StackConfig) error {
+	// Normalize: convert legacy github_username to users array
+	if len(cfg.Users) == 0 && cfg.GitHubUsername != "" {
+		cfg.Users = []User{
+			{
+				Username:       cfg.GitHubUsername,
+				GitHubUsername: cfg.GitHubUsername,
+			},
+		}
+	}
+
+	// Require at least one user
+	if len(cfg.Users) == 0 {
+		return fmt.Errorf("at least one user required: specify 'github_username' or 'users'")
+	}
+
+	// Validate each user
+	seen := make(map[string]bool)
+	for i, user := range cfg.Users {
+		if user.Username == "" {
+			return fmt.Errorf("user[%d]: username cannot be empty", i)
+		}
+		if user.GitHubUsername == "" {
+			return fmt.Errorf("user[%d]: github_username cannot be empty", i)
+		}
+
+		// Check for duplicate usernames
+		if seen[user.Username] {
+			return fmt.Errorf("duplicate username: %s", user.Username)
+		}
+		seen[user.Username] = true
+
+		// Validate username format
+		if !isValidLinuxUsername(user.Username) {
+			return fmt.Errorf("invalid username format: %s (must be lowercase alphanumeric, start with letter)", user.Username)
+		}
+	}
+
+	return nil
+}
+
+func isValidLinuxUsername(username string) bool {
+	if len(username) == 0 || len(username) > 32 {
+		return false
+	}
+
+	// Must start with lowercase letter
+	if username[0] < 'a' || username[0] > 'z' {
+		return false
+	}
+
+	// Rest can be alphanumeric, underscore, or hyphen
+	for _, ch := range username {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateDNSConfig(cfg *StackConfig) error {
+	// Validate CNAME aliases
+	if len(cfg.CNAMEAliases) > 0 {
+		if cfg.Hostname == "" || cfg.Domain == "" {
+			return fmt.Errorf("cname_aliases requires both hostname and domain")
+		}
+
+		// Check for duplicates and empty strings
+		seen := make(map[string]bool)
+		for _, alias := range cfg.CNAMEAliases {
+			if alias == "" {
+				return fmt.Errorf("cname_aliases cannot contain empty strings")
+			}
+			if alias == cfg.Hostname {
+				return fmt.Errorf("cname_aliases cannot duplicate primary hostname: %s", alias)
+			}
+			if seen[alias] {
+				return fmt.Errorf("duplicate cname_alias: %s", alias)
+			}
+			seen[alias] = true
+		}
+	}
+
+	// Validate apex domain
+	if cfg.IsApexDomain && cfg.Domain == "" {
+		return fmt.Errorf("is_apex_domain requires domain to be specified")
+	}
+
+	return nil
+}
+
+func encodeUsers(users []User) string {
+	var parts []string
+	for _, user := range users {
+		parts = append(parts, fmt.Sprintf("%s:%s", user.Username, user.GitHubUsername))
+	}
+	return strings.Join(parts, ",")
+}
+
+func createARecord(ctx context.Context, r53Client *route53.Client, zoneID, name, ip string, ttl int) error {
+	if !strings.HasSuffix(name, ".") {
+		name = name + "."
 	}
 
 	input := &route53.ChangeResourceRecordSetsInput{
@@ -260,7 +386,7 @@ func createDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqd
 				{
 					Action: r53types.ChangeActionUpsert,
 					ResourceRecordSet: &r53types.ResourceRecordSet{
-						Name: aws.String(fqdn),
+						Name: aws.String(name),
 						Type: r53types.RRTypeA,
 						TTL:  aws.Int64(int64(ttl)),
 						ResourceRecords: []r53types.ResourceRecord{
@@ -276,9 +402,40 @@ func createDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqd
 	return err
 }
 
-func deleteDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqdn, ip string, ttl int) error {
-	if !strings.HasSuffix(fqdn, ".") {
-		fqdn = fqdn + "."
+func createCNAMERecord(ctx context.Context, r53Client *route53.Client, zoneID, name, target string, ttl int) error {
+	if !strings.HasSuffix(name, ".") {
+		name = name + "."
+	}
+	if !strings.HasSuffix(target, ".") {
+		target = target + "."
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(zoneID),
+		ChangeBatch: &r53types.ChangeBatch{
+			Changes: []r53types.Change{
+				{
+					Action: r53types.ChangeActionUpsert,
+					ResourceRecordSet: &r53types.ResourceRecordSet{
+						Name: aws.String(name),
+						Type: r53types.RRTypeCname,
+						TTL:  aws.Int64(int64(ttl)),
+						ResourceRecords: []r53types.ResourceRecord{
+							{Value: aws.String(target)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := r53Client.ChangeResourceRecordSets(ctx, input)
+	return err
+}
+
+func deleteARecord(ctx context.Context, r53Client *route53.Client, zoneID, name, ip string, ttl int) error {
+	if !strings.HasSuffix(name, ".") {
+		name = name + "."
 	}
 
 	input := &route53.ChangeResourceRecordSetsInput{
@@ -288,7 +445,7 @@ func deleteDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqd
 				{
 					Action: r53types.ChangeActionDelete,
 					ResourceRecordSet: &r53types.ResourceRecordSet{
-						Name: aws.String(fqdn),
+						Name: aws.String(name),
 						Type: r53types.RRTypeA,
 						TTL:  aws.Int64(int64(ttl)),
 						ResourceRecords: []r53types.ResourceRecord{
@@ -304,22 +461,123 @@ func deleteDNSRecord(ctx context.Context, r53Client *route53.Client, zoneID, fqd
 	return err
 }
 
+func deleteCNAMERecord(ctx context.Context, r53Client *route53.Client, zoneID, name, target string, ttl int) error {
+	if !strings.HasSuffix(name, ".") {
+		name = name + "."
+	}
+	if !strings.HasSuffix(target, ".") {
+		target = target + "."
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(zoneID),
+		ChangeBatch: &r53types.ChangeBatch{
+			Changes: []r53types.Change{
+				{
+					Action: r53types.ChangeActionDelete,
+					ResourceRecordSet: &r53types.ResourceRecordSet{
+						Name: aws.String(name),
+						Type: r53types.RRTypeCname,
+						TTL:  aws.Int64(int64(ttl)),
+						ResourceRecords: []r53types.ResourceRecord{
+							{Value: aws.String(target)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := r53Client.ChangeResourceRecordSets(ctx, input)
+	return err
+}
+
+func deleteCreatedRecords(ctx context.Context, r53Client *route53.Client, zoneID string, records []DNSRecord) {
+	for _, record := range records {
+		if record.Type == "A" {
+			deleteARecord(ctx, r53Client, zoneID, record.Name, record.Value, record.TTL)
+		} else if record.Type == "CNAME" {
+			deleteCNAMERecord(ctx, r53Client, zoneID, record.Name, record.Value, record.TTL)
+		}
+	}
+}
+
+func createDNSRecords(ctx context.Context, r53Client *route53.Client, cfg *StackConfig) ([]DNSRecord, error) {
+	var createdRecords []DNSRecord
+
+	if cfg.Domain == "" {
+		return createdRecords, nil
+	}
+
+	// 1. Create primary A record (hostname.domain -> IP)
+	if cfg.Hostname != "" {
+		fqdn := fmt.Sprintf("%s.%s", cfg.Hostname, cfg.Domain)
+		err := createARecord(ctx, r53Client, cfg.ZoneID, fqdn, cfg.PublicIP, cfg.TTL)
+		if err != nil {
+			return createdRecords, fmt.Errorf("failed to create primary A record: %w", err)
+		}
+		createdRecords = append(createdRecords, DNSRecord{
+			Name:  fqdn,
+			Type:  "A",
+			Value: cfg.PublicIP,
+			TTL:   cfg.TTL,
+		})
+	}
+
+	// 2. Create CNAME records (alias.domain -> hostname.domain)
+	if cfg.Hostname != "" && len(cfg.CNAMEAliases) > 0 {
+		targetFQDN := fmt.Sprintf("%s.%s", cfg.Hostname, cfg.Domain)
+		for _, alias := range cfg.CNAMEAliases {
+			aliasFQDN := fmt.Sprintf("%s.%s", alias, cfg.Domain)
+			err := createCNAMERecord(ctx, r53Client, cfg.ZoneID, aliasFQDN, targetFQDN, cfg.TTL)
+			if err != nil {
+				deleteCreatedRecords(ctx, r53Client, cfg.ZoneID, createdRecords)
+				return nil, fmt.Errorf("failed to create CNAME %s: %w", aliasFQDN, err)
+			}
+			createdRecords = append(createdRecords, DNSRecord{
+				Name:  aliasFQDN,
+				Type:  "CNAME",
+				Value: targetFQDN,
+				TTL:   cfg.TTL,
+			})
+		}
+	}
+
+	// 3. Create apex A record (domain -> IP)
+	if cfg.IsApexDomain {
+		err := createARecord(ctx, r53Client, cfg.ZoneID, cfg.Domain, cfg.PublicIP, cfg.TTL)
+		if err != nil {
+			deleteCreatedRecords(ctx, r53Client, cfg.ZoneID, createdRecords)
+			return nil, fmt.Errorf("failed to create apex A record: %w", err)
+		}
+		createdRecords = append(createdRecords, DNSRecord{
+			Name:  cfg.Domain,
+			Type:  "A",
+			Value: cfg.PublicIP,
+			TTL:   cfg.TTL,
+		})
+	}
+
+	return createdRecords, nil
+}
+
 func createStack(stackName string) {
 	ctx := context.Background()
 
 	// Read config
 	stackCfg, configFile, err := readConfig(stackName)
 	if err != nil {
-		log.Fatalf("Error: %v\n\nCreate a config file stacks/%s.json with:\n%s", err, stackName, `{
-  "github_username": "your-github-username",
-  "instance_type": "t3.micro",
-  "hostname": "dev",
-  "domain": "example.com"
-}`)
+		log.Fatalf("Error: %v", err)
 	}
 
-	if stackCfg.GitHubUsername == "" {
-		log.Fatal("github_username is required in config file")
+	// Validate user configuration
+	if err := validateUserConfig(stackCfg); err != nil {
+		log.Fatalf("Invalid user configuration: %v", err)
+	}
+
+	// Validate DNS configuration
+	if err := validateDNSConfig(stackCfg); err != nil {
+		log.Fatalf("Invalid DNS configuration: %v", err)
 	}
 
 	// Load AWS config
@@ -331,7 +589,10 @@ func createStack(stackName string) {
 	fmt.Printf("Using AWS Region: %s\n", awsCfg.Region)
 	fmt.Printf("Config File: %s\n", configFile)
 	fmt.Printf("Stack Name: %s\n", stackName)
-	fmt.Printf("GitHub Username: %s\n", stackCfg.GitHubUsername)
+	fmt.Printf("Users to create: %d\n", len(stackCfg.Users))
+	for _, user := range stackCfg.Users {
+		fmt.Printf("  - %s (GitHub: %s)\n", user.Username, user.GitHubUsername)
+	}
 	fmt.Printf("Instance Type: %s\n", stackCfg.InstanceType)
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
@@ -339,16 +600,17 @@ func createStack(stackName string) {
 
 	// Lookup zone ID if domain is specified
 	var zoneID string
-	var fqdn string
-	if stackCfg.Domain != "" && stackCfg.Hostname != "" {
+	if stackCfg.Domain != "" {
 		fmt.Printf("Looking up zone ID for %s...\n", stackCfg.Domain)
 		zoneID, err = lookupZoneID(ctx, r53Client, stackCfg.Domain)
 		if err != nil {
 			log.Fatalf("failed to lookup zone ID: %v", err)
 		}
 		fmt.Printf("Found Zone ID: %s\n", zoneID)
-		fqdn = fmt.Sprintf("%s.%s", stackCfg.Hostname, stackCfg.Domain)
 	}
+
+	// Encode users for CloudFormation parameter
+	usersParam := encodeUsers(stackCfg.Users)
 
 	// Create CloudFormation stack
 	input := &cloudformation.CreateStackInput{
@@ -356,8 +618,8 @@ func createStack(stackName string) {
 		TemplateBody: aws.String(cloudFormationTemplate),
 		Parameters: []types.Parameter{
 			{
-				ParameterKey:   aws.String("GitHubUsername"),
-				ParameterValue: aws.String(stackCfg.GitHubUsername),
+				ParameterKey:   aws.String("Users"),
+				ParameterValue: aws.String(usersParam),
 			},
 			{
 				ParameterKey:   aws.String("InstanceType"),
@@ -418,20 +680,31 @@ func createStack(stackName string) {
 		}
 	}
 
-	// Create DNS record if configured
-	if zoneID != "" && fqdn != "" {
-		fmt.Printf("Creating DNS record: %s -> %s\n", fqdn, stackCfg.PublicIP)
-		err = createDNSRecord(ctx, r53Client, zoneID, fqdn, stackCfg.PublicIP, stackCfg.TTL)
+	// Create DNS records if configured
+	if zoneID != "" {
+		fmt.Println("Creating DNS records...")
+		stackCfg.ZoneID = zoneID
+		dnsRecords, err := createDNSRecords(ctx, r53Client, stackCfg)
 		if err != nil {
-			log.Printf("Warning: failed to create DNS record: %v", err)
+			log.Printf("Warning: failed to create DNS records: %v", err)
 		} else {
-			fmt.Println("DNS record created successfully")
-			stackCfg.ZoneID = zoneID
-			stackCfg.FQDN = fqdn
-			stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.GitHubUsername, fqdn)
+			fmt.Printf("Created %d DNS record(s) successfully\n", len(dnsRecords))
+			stackCfg.DNSRecords = dnsRecords
+
+			// Set FQDN to primary hostname or apex if no hostname
+			if stackCfg.Hostname != "" {
+				stackCfg.FQDN = fmt.Sprintf("%s.%s", stackCfg.Hostname, stackCfg.Domain)
+			} else if stackCfg.IsApexDomain {
+				stackCfg.FQDN = stackCfg.Domain
+			}
 		}
+	}
+
+	// Set SSH command
+	if stackCfg.FQDN != "" {
+		stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.Users[0].Username, stackCfg.FQDN)
 	} else {
-		stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.GitHubUsername, stackCfg.PublicIP)
+		stackCfg.SSHCommand = fmt.Sprintf("ssh %s@%s", stackCfg.Users[0].Username, stackCfg.PublicIP)
 	}
 
 	// Write updated config
@@ -468,16 +741,26 @@ func deleteStack(stackName string) {
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
 
-	// Delete DNS record if it was configured
-	if stackCfg != nil && stackCfg.ZoneID != "" && stackCfg.FQDN != "" && stackCfg.PublicIP != "" {
-		fmt.Printf("Deleting DNS record: %s\n", stackCfg.FQDN)
+	// Delete DNS records if they were configured
+	if stackCfg != nil && stackCfg.ZoneID != "" && len(stackCfg.DNSRecords) > 0 {
+		fmt.Printf("Deleting %d DNS record(s)...\n", len(stackCfg.DNSRecords))
 		r53Client := route53.NewFromConfig(awsCfg)
-		err = deleteDNSRecord(ctx, r53Client, stackCfg.ZoneID, stackCfg.FQDN, stackCfg.PublicIP, stackCfg.TTL)
-		if err != nil {
-			log.Printf("Warning: failed to delete DNS record: %v", err)
-		} else {
-			fmt.Println("DNS record deleted")
+
+		for _, record := range stackCfg.DNSRecords {
+			fmt.Printf("  Deleting %s record: %s -> %s\n", record.Type, record.Name, record.Value)
+
+			var err error
+			if record.Type == "A" {
+				err = deleteARecord(ctx, r53Client, stackCfg.ZoneID, record.Name, record.Value, record.TTL)
+			} else if record.Type == "CNAME" {
+				err = deleteCNAMERecord(ctx, r53Client, stackCfg.ZoneID, record.Name, record.Value, record.TTL)
+			}
+
+			if err != nil {
+				log.Printf("Warning: failed to delete DNS record %s: %v", record.Name, err)
+			}
 		}
+		fmt.Println("DNS records deleted")
 	}
 
 	// Delete CloudFormation stack
@@ -509,6 +792,7 @@ func deleteStack(stackName string) {
 		stackCfg.ZoneID = ""
 		stackCfg.FQDN = ""
 		stackCfg.SSHCommand = ""
+		stackCfg.DNSRecords = []DNSRecord{}
 		if err := writeConfig(configFile, stackCfg); err != nil {
 			log.Printf("Warning: failed to update config file: %v", err)
 		} else {
