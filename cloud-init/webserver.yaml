@@ -1,0 +1,139 @@
+#cloud-config
+# Webserver cloud-init configuration
+# Template variables available: {{.Hostname}}, {{.Domain}}, {{.FQDN}}, {{.Region}}, {{.OS}}, {{.Users}}
+
+hostname: {{.Hostname}}
+fqdn: {{.FQDN}}
+manage_etc_hosts: true
+
+packages:
+  - curl
+  - wget
+  - vim
+  - git
+  - debian-keyring
+  - debian-archive-keyring
+  - apt-transport-https
+
+# Create caddy user and web directories
+users:
+  - name: caddy
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/caddy
+
+write_files:
+  - path: /etc/caddy/Caddyfile
+    content: |
+      {{.FQDN}} {
+        root * /var/www/html
+        file_server
+        encode gzip
+
+        log {
+          output file /var/log/caddy/access.log
+          format json
+        }
+
+        header {
+          X-Content-Type-Options "nosniff"
+          X-Frame-Options "DENY"
+          Referrer-Policy "no-referrer-when-downgrade"
+        }
+      }
+    owner: caddy:caddy
+    permissions: '0644'
+
+  - path: /var/www/html/index.html
+    content: |
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{{.FQDN}}</title>
+        <style>
+          body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px;
+            margin: 100px auto;
+            padding: 20px;
+            line-height: 1.6;
+          }
+          h1 { color: #2c3e50; }
+          .info { background: #f8f9fa; padding: 20px; border-radius: 5px; }
+          code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
+        </style>
+      </head>
+      <body>
+        <h1>Welcome to {{.FQDN}}</h1>
+        <div class="info">
+          <p><strong>Server:</strong> {{.FQDN}}</p>
+          <p><strong>OS:</strong> {{.OS}}</p>
+          <p><strong>Region:</strong> {{.Region}}</p>
+        </div>
+        <h2>Getting Started</h2>
+        <p>Web root: <code>/var/www/html</code></p>
+        <p>Caddy logs: <code>/var/log/caddy/</code></p>
+        <h3>Useful commands:</h3>
+        <ul>
+          <li><code>sudo systemctl status caddy</code></li>
+          <li><code>sudo journalctl -u caddy -f</code></li>
+          <li><code>sudo caddy reload --config /etc/caddy/Caddyfile</code></li>
+        </ul>
+      </body>
+      </html>
+    owner: www-data:www-data
+    permissions: '0644'
+
+  - path: /etc/profile.d/caddy-motd.sh
+    content: |
+      #!/bin/bash
+      cat << 'EOF'
+
+      ========================================
+        Server: {{.FQDN}}
+        OS: {{.OS}}
+        Region: {{.Region}}
+      ========================================
+
+      Web root: /var/www/html
+      Caddy logs: /var/log/caddy/
+
+      Useful commands:
+        sudo systemctl status caddy
+        sudo journalctl -u caddy -f
+        sudo caddy reload --config /etc/caddy/Caddyfile
+
+      ========================================
+      EOF
+    permissions: '0755'
+
+runcmd:
+  # Install Caddy
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+  - apt-get update
+  - apt-get install -y caddy
+
+  # Create directories
+  - mkdir -p /var/www/html
+  - mkdir -p /var/log/caddy
+  - mkdir -p /var/lib/caddy
+
+  # Set ownership
+  - chown -R caddy:caddy /var/lib/caddy
+  - chown -R caddy:caddy /var/log/caddy
+  - chown -R www-data:www-data /var/www/html
+  - chmod 755 /var/www/html
+
+  # Ensure Caddy config directory exists
+  - mkdir -p /etc/caddy
+  - chown -R caddy:caddy /etc/caddy
+
+  # Enable and start Caddy
+  - systemctl daemon-reload
+  - systemctl enable caddy
+  - systemctl restart caddy
+
+final_message: "Webserver setup complete. System boot took $UPTIME seconds."

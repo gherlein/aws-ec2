@@ -1,0 +1,15 @@
+{
+  "region": "us-east-1",
+  "os": "ubuntu-22.04",
+  "cloud_init_file": "cloud-init/webserver.yaml",
+  "users": [
+    {
+      "username": "admin",
+      "github_username": "gherlein"
+    }
+  ],
+  "instance_type": "t3.micro",
+  "hostname": "www",
+  "domain": "example.com",
+  "ttl": 300
+}
