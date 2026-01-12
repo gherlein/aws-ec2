@@ -85,7 +85,7 @@ var osSSMPaths = map[string]string{
 	"debian-11":         "/aws/service/debian/release/11/latest/amd64",
 }
 
-const cloudFormationTemplate = `
+const cloudFormationTemplateStr = `
 AWSTemplateFormatVersion: '2010-09-09'
 Description: EC2 instance with SSH access
 
@@ -97,9 +97,6 @@ Parameters:
     Type: String
     Description: EC2 instance type
     Default: t3.micro
-  UserData:
-    Type: String
-    Description: Base64 encoded UserData script
   VpcId:
     Type: String
     Description: VPC ID for the security group (required)
@@ -141,7 +138,7 @@ Resources:
           AssociatePublicIpAddress: true
           GroupSet:
             - !GetAtt SSHSecurityGroup.GroupId
-      UserData: !Ref UserData
+      UserData: {{.UserData}}
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
@@ -166,6 +163,26 @@ Outputs:
     Description: Subnet ID
     Value: !Ref SubnetId
 `
+
+func generateCloudFormationTemplate(userData string) (string, error) {
+	tmpl, err := template.New("cfn").Parse(cloudFormationTemplateStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CFN template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	data := struct {
+		UserData string
+	}{
+		UserData: userData,
+	}
+
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute CFN template: %w", err)
+	}
+
+	return buf.String(), nil
+}
 
 func main() {
 	createCmd := flag.Bool("create", false, "Create a new EC2 instance")
@@ -621,6 +638,7 @@ func generateUserSetupScript(users []User) string {
 	for _, user := range users {
 		script.WriteString(fmt.Sprintf("\n# Create user: %s (GitHub: %s)\n", user.Username, user.GitHubUsername))
 		script.WriteString(fmt.Sprintf("useradd -m -s /bin/bash %q || true\n", user.Username))
+		script.WriteString(fmt.Sprintf("usermod -a -G www-data %s\n", user.Username))
 		script.WriteString(fmt.Sprintf("echo %q ' ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/%s\n", user.Username, user.Username))
 		script.WriteString(fmt.Sprintf("mkdir -p /home/%s/.ssh\n", user.Username))
 		script.WriteString(fmt.Sprintf("chmod 700 /home/%s/.ssh\n", user.Username))
@@ -1173,10 +1191,16 @@ func createStack(stackName string) {
 
 	userData := generateMultipartUserData(userScript, cloudInitContent)
 
+	// Generate CloudFormation template with embedded UserData
+	cfnTemplate, err := generateCloudFormationTemplate(userData)
+	if err != nil {
+		log.Fatalf("failed to generate CloudFormation template: %v", err)
+	}
+
 	// Create CloudFormation stack
 	input := &cloudformation.CreateStackInput{
 		StackName:    &stackName,
-		TemplateBody: aws.String(cloudFormationTemplate),
+		TemplateBody: aws.String(cfnTemplate),
 		Parameters: []types.Parameter{
 			{
 				ParameterKey:   aws.String("ImageId"),
@@ -1185,10 +1209,6 @@ func createStack(stackName string) {
 			{
 				ParameterKey:   aws.String("InstanceType"),
 				ParameterValue: aws.String(stackCfg.InstanceType),
-			},
-			{
-				ParameterKey:   aws.String("UserData"),
-				ParameterValue: aws.String(userData),
 			},
 			{
 				ParameterKey:   aws.String("VpcId"),

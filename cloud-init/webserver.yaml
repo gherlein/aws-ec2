@@ -134,11 +134,6 @@ runcmd:
   - mkdir -p /etc/caddy
   - chown -R caddy:caddy /etc/caddy
 
-  # Add users to www-data group for web content management
-{{range .Users}}
-  - usermod -a -G www-data {{.Username}}
-{{end}}
-
   # Enable and start Caddy
   - systemctl daemon-reload
   - systemctl enable caddy
