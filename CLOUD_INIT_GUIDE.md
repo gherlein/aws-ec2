@@ -45,6 +45,8 @@ Cloud-init files are Go templates with access to:
 | `{{.FQDN}}` | string | `www.example.com` | Full domain name |
 | `{{.Region}}` | string | `us-east-1` | AWS region |
 | `{{.OS}}` | string | `ubuntu-22.04` | Operating system |
+| `{{.WorkingDir}}` | string | `/var/www/html` | Working directory for deployments |
+| `{{.Packages}}` | []string | `["htop", "tree"]` | Additional packages to install |
 | `{{.Users}}` | []User | `[{Username: "admin", GitHubUsername: "gherlein"}]` | User array |
 
 ### User Object Structure
@@ -68,13 +70,15 @@ Access in templates:
 
 ### Config File
 
-Add `cloud_init_file` to your stack config:
+Add `cloud_init_file`, `working_dir`, and `packages` to your stack config:
 
 ```json
 {
   "region": "us-east-1",
   "os": "ubuntu-22.04",
   "cloud_init_file": "cloud-init/webserver.yaml",
+  "working_dir": "/var/www/html",
+  "packages": ["htop", "net-tools", "tree"],
   "users": [
     {"username": "admin", "github_username": "gherlein"}
   ],
@@ -82,6 +86,10 @@ Add `cloud_init_file` to your stack config:
   "domain": "example.com"
 }
 ```
+
+**New Fields:**
+- `working_dir` (optional): Base directory for file deployments. Defaults to `/var/www/html` if not specified.
+- `packages` (optional): Array of package names to install via apt-get. These are installed in addition to base packages in cloud-init.
 
 ### Path Resolution
 
@@ -111,6 +119,8 @@ See the included `cloud-init/webserver.yaml` for a complete Caddy webserver setu
 - Installs Caddy from official repo
 - Configures Caddyfile with HTTPS
 - Sets up web root at `/var/www/html`
+- Adds all users to `www-data` group for deployment access
+- Sets `/var/www/html` permissions to 775 (group writable)
 - Creates welcome page with server info
 - Configures logging
 - Adds MOTD banner
@@ -134,6 +144,9 @@ See the included `cloud-init/webserver.yaml` for a complete Caddy webserver setu
 - https://www.example.com serves content
 - SSH: `ssh admin@www.example.com`
 - Logs: `/var/log/caddy/access.log`
+- Web files deployed to: `/var/www/html`
+- Additional packages installed: `htop`, `net-tools`, `jq`
+- User `admin` is in `www-data` group for deployment access
 
 ### Database Server
 
@@ -209,7 +222,23 @@ packages:
   - nginx
   - postgresql-14
   - redis-server
+{{range .Packages}}
+  - {{.}}
+{{end}}
 ```
+
+The template includes packages from the JSON config automatically. Config packages are appended to the base package list in cloud-init.
+
+**Example Config:**
+```json
+{
+  "packages": ["htop", "tree", "docker.io"]
+}
+```
+
+**Resulting Package List:**
+- Base packages: curl, wget, vim, git, etc.
+- Config packages: htop, tree, docker.io
 
 ### Users
 
@@ -244,6 +273,16 @@ write_files:
     owner: app:app
     permissions: '0644'
 
+  - path: {{.WorkingDir}}/index.html
+    content: |
+      <!DOCTYPE html>
+      <html>
+        <head><title>{{.FQDN}}</title></head>
+        <body><h1>Welcome to {{.FQDN}}</h1></body>
+      </html>
+    owner: www-data:www-data
+    permissions: '0644'
+
   - path: /opt/app/startup.sh
     content: |
       #!/bin/bash
@@ -251,6 +290,17 @@ write_files:
       ./myapp --config /etc/myapp/config.yaml
     permissions: '0755'
 ```
+
+**Using WorkingDir:**
+The `{{.WorkingDir}}` template variable allows dynamic file placement based on config:
+
+```json
+{
+  "working_dir": "/srv/myapp/public"
+}
+```
+
+Files will be created in `/srv/myapp/public` instead of the default `/var/www/html`.
 
 ### Commands
 
@@ -271,6 +321,24 @@ Commands run as root. Use `sudo -u user` for specific users:
 runcmd:
   - sudo -u app /opt/app/setup.sh
 ```
+
+### Modifying Users Created by Shell Script
+
+Users are created by the shell script before cloud-init runs. Use templates to modify them:
+
+```yaml
+runcmd:
+  # Add all users to a group
+{{range .Users}}
+  - usermod -a -G docker {{.Username}}
+  - usermod -a -G www-data {{.Username}}
+{{end}}
+```
+
+This is useful for:
+- Adding users to deployment groups (www-data)
+- Adding users to Docker group
+- Setting up application-specific permissions
 
 ### Networking
 

@@ -2,6 +2,12 @@
   "region": "us-east-1",
   "os": "ubuntu-22.04",
   "cloud_init_file": "cloud-init/webserver.yaml",
+  "working_dir": "/var/www/html",
+  "packages": [
+    "htop",
+    "net-tools",
+    "jq"
+  ],
   "users": [
     {
       "username": "admin",

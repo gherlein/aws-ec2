@@ -44,6 +44,8 @@ type StackConfig struct {
 	InstanceType   string   `json:"instance_type,omitempty"`
 	OS             string   `json:"os,omitempty"`
 	CloudInitFile  string   `json:"cloud_init_file,omitempty"`
+	WorkingDir     string   `json:"working_dir,omitempty"`
+	Packages       []string `json:"packages,omitempty"`
 	Hostname       string   `json:"hostname,omitempty"`
 	Domain         string   `json:"domain,omitempty"`
 	TTL            int      `json:"ttl,omitempty"`
@@ -632,12 +634,14 @@ func generateUserSetupScript(users []User) string {
 }
 
 type CloudInitTemplateData struct {
-	Hostname string
-	Domain   string
-	FQDN     string
-	Region   string
-	OS       string
-	Users    []User
+	Hostname   string
+	Domain     string
+	FQDN       string
+	Region     string
+	OS         string
+	WorkingDir string
+	Packages   []string
+	Users      []User
 }
 
 func processCloudInitTemplate(templatePath string, data CloudInitTemplateData) (string, error) {
@@ -1144,13 +1148,21 @@ func createStack(stackName string) {
 			fqdn = fmt.Sprintf("%s.%s", stackCfg.Hostname, stackCfg.Domain)
 		}
 
+		// Default working directory
+		workingDir := stackCfg.WorkingDir
+		if workingDir == "" {
+			workingDir = "/var/www/html"
+		}
+
 		templateData := CloudInitTemplateData{
-			Hostname: stackCfg.Hostname,
-			Domain:   stackCfg.Domain,
-			FQDN:     fqdn,
-			Region:   stackCfg.Region,
-			OS:       stackCfg.OS,
-			Users:    stackCfg.Users,
+			Hostname:   stackCfg.Hostname,
+			Domain:     stackCfg.Domain,
+			FQDN:       fqdn,
+			Region:     stackCfg.Region,
+			OS:         stackCfg.OS,
+			WorkingDir: workingDir,
+			Packages:   stackCfg.Packages,
+			Users:      stackCfg.Users,
 		}
 
 		cloudInitContent, err = processCloudInitTemplate(cloudInitPath, templateData)
