@@ -1,4 +1,5 @@
 {
+  "region": "us-east-1",
   "users": [
     {
       "username": "admin",
@@ -14,15 +15,5 @@
   "domain": "example.com",
   "ttl": 300,
   "is_apex_domain": false,
-  "cname_aliases": ["api", "staging"],
-  "stack_name": "",
-  "stack_id": "",
-  "region": "",
-  "instance_id": "",
-  "public_ip": "",
-  "security_group": "",
-  "zone_id": "",
-  "fqdn": "",
-  "ssh_command": "",
-  "dns_records": []
+  "cname_aliases": ["api", "staging"]
 }

@@ -1,4 +1,5 @@
 {
+  "region": "us-east-1",
   "users": [
     {
       "username": "admin",
@@ -9,15 +10,5 @@
       "github_username": "dev-github-username"
     }
   ],
-  "instance_type": "t3.micro",
-  "stack_name": "",
-  "stack_id": "",
-  "region": "",
-  "instance_id": "",
-  "public_ip": "",
-  "security_group": "",
-  "zone_id": "",
-  "fqdn": "",
-  "ssh_command": "",
-  "dns_records": []
+  "instance_type": "t3.micro"
 }

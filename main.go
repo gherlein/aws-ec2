@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -16,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 type User struct {
@@ -35,6 +40,8 @@ type StackConfig struct {
 	GitHubUsername string   `json:"github_username,omitempty"`
 	Users          []User   `json:"users,omitempty"`
 	InstanceType   string   `json:"instance_type,omitempty"`
+	OS             string   `json:"os,omitempty"`
+	CloudInitFile  string   `json:"cloud_init_file,omitempty"`
 	Hostname       string   `json:"hostname,omitempty"`
 	Domain         string   `json:"domain,omitempty"`
 	TTL            int      `json:"ttl,omitempty"`
@@ -45,6 +52,7 @@ type StackConfig struct {
 	StackName     string      `json:"stack_name,omitempty"`
 	StackID       string      `json:"stack_id,omitempty"`
 	Region        string      `json:"region,omitempty"`
+	AMIID         string      `json:"ami_id,omitempty"`
 	InstanceID    string      `json:"instance_id,omitempty"`
 	PublicIP      string      `json:"public_ip,omitempty"`
 	SecurityGroup string      `json:"security_group,omitempty"`
@@ -54,21 +62,31 @@ type StackConfig struct {
 	DNSRecords    []DNSRecord `json:"dns_records,omitempty"`
 }
 
+var osSSMPaths = map[string]string{
+	"amazon-linux-2023": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+	"amazon-linux-2":    "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2",
+	"ubuntu-24.04":      "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
+	"ubuntu-22.04":      "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
+	"ubuntu-20.04":      "/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
+	"debian-12":         "/aws/service/debian/release/12/latest/amd64",
+	"debian-11":         "/aws/service/debian/release/11/latest/amd64",
+}
+
 const cloudFormationTemplate = `
 AWSTemplateFormatVersion: '2010-09-09'
 Description: EC2 instance with SSH access
 
 Parameters:
-  LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-  Users:
+  ImageId:
     Type: String
-    Description: Comma-separated list of username:github_username pairs
+    Description: AMI ID for the EC2 instance
   InstanceType:
     Type: String
     Description: EC2 instance type
     Default: t3.micro
+  UserData:
+    Type: String
+    Description: Base64 encoded UserData script
 
 Resources:
   SSHSecurityGroup:
@@ -88,45 +106,10 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
-      ImageId: !Ref LatestAmiId
+      ImageId: !Ref ImageId
       SecurityGroupIds:
         - !GetAtt SSHSecurityGroup.GroupId
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          set -e
-
-          # Users parameter format: username1:github1,username2:github2
-          USERS="${Users}"
-
-          # Split by comma and process each user
-          IFS=',' read -ra USER_ARRAY <<< "$USERS"
-          for user_spec in "$${USER_ARRAY[@]}"; do
-            # Split by colon to get username and github_username
-            IFS=':' read -r USERNAME GITHUB_USER <<< "$user_spec"
-
-            echo "Creating user: $USERNAME (GitHub: $GITHUB_USER)"
-
-            # Create user with sudo access
-            useradd -m -s /bin/bash "$USERNAME"
-            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
-
-            # Setup SSH directory
-            SSH_DIR="/home/$USERNAME/.ssh"
-            AUTH_KEYS="$SSH_DIR/authorized_keys"
-
-            mkdir -p "$SSH_DIR"
-            chmod 700 "$SSH_DIR"
-
-            # Download public keys from GitHub
-            curl -s "https://github.com/$GITHUB_USER.keys" > "$AUTH_KEYS"
-
-            # Set correct permissions
-            chmod 600 "$AUTH_KEYS"
-            chown -R "$USERNAME:$USERNAME" "$SSH_DIR"
-
-            echo "User $USERNAME created with SSH keys from GitHub ($GITHUB_USER)"
-          done
+      UserData: !Ref UserData
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
@@ -164,13 +147,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nThe tool looks for stacks/<name>.json first, then treats name as a path.\n")
 		fmt.Fprintf(os.Stderr, "\nConfig file format (stacks/mystack.json):\n")
 		fmt.Fprintf(os.Stderr, `  {
-    "github_username": "gherlein",
+    "region": "us-east-1",
+    "os": "ubuntu-22.04",
+    "cloud_init_file": "cloud-init/setup.yaml",
+    "users": [{"username": "admin", "github_username": "gherlein"}],
     "instance_type": "t3.micro",
     "hostname": "dev",
     "domain": "example.com",
     "ttl": 300
   }
 `)
+		fmt.Fprintf(os.Stderr, "\nSupported OS values:\n")
+		fmt.Fprintf(os.Stderr, "  amazon-linux-2023, amazon-linux-2, ubuntu-24.04, ubuntu-22.04,\n")
+		fmt.Fprintf(os.Stderr, "  ubuntu-20.04, debian-12, debian-11\n")
 	}
 
 	flag.Parse()
@@ -246,6 +235,12 @@ func readConfig(stackName string) (*StackConfig, string, error) {
 	if cfg.TTL == 0 {
 		cfg.TTL = 300
 	}
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+	if cfg.OS == "" {
+		cfg.OS = "amazon-linux-2023"
+	}
 
 	return &cfg, filename, nil
 }
@@ -256,6 +251,103 @@ func writeConfig(filename string, cfg *StackConfig) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+func lookupAMI(ctx context.Context, ssmClient *ssm.Client, osName string) (string, error) {
+	ssmPath, ok := osSSMPaths[osName]
+	if !ok {
+		var supported []string
+		for k := range osSSMPaths {
+			supported = append(supported, k)
+		}
+		return "", fmt.Errorf("unsupported OS %q, supported: %v", osName, supported)
+	}
+
+	result, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: aws.String(ssmPath),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup AMI for %s: %w", osName, err)
+	}
+
+	return *result.Parameter.Value, nil
+}
+
+func generateUserSetupScript(users []User) string {
+	var script strings.Builder
+	script.WriteString("#!/bin/bash\n")
+	script.WriteString("set -e\n\n")
+	script.WriteString("# Auto-generated user setup script\n")
+
+	for _, user := range users {
+		script.WriteString(fmt.Sprintf("\n# Create user: %s (GitHub: %s)\n", user.Username, user.GitHubUsername))
+		script.WriteString(fmt.Sprintf("useradd -m -s /bin/bash %q || true\n", user.Username))
+		script.WriteString(fmt.Sprintf("echo %q ' ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/%s\n", user.Username, user.Username))
+		script.WriteString(fmt.Sprintf("mkdir -p /home/%s/.ssh\n", user.Username))
+		script.WriteString(fmt.Sprintf("chmod 700 /home/%s/.ssh\n", user.Username))
+		script.WriteString(fmt.Sprintf("curl -s https://github.com/%s.keys > /home/%s/.ssh/authorized_keys\n", user.GitHubUsername, user.Username))
+		script.WriteString(fmt.Sprintf("chmod 600 /home/%s/.ssh/authorized_keys\n", user.Username))
+		script.WriteString(fmt.Sprintf("chown -R %s:%s /home/%s/.ssh\n", user.Username, user.Username, user.Username))
+		script.WriteString(fmt.Sprintf("echo 'User %s created with SSH keys from GitHub (%s)'\n", user.Username, user.GitHubUsername))
+	}
+
+	return script.String()
+}
+
+type CloudInitTemplateData struct {
+	Hostname string
+	Domain   string
+	FQDN     string
+	Region   string
+	OS       string
+	Users    []User
+}
+
+func processCloudInitTemplate(templatePath string, data CloudInitTemplateData) (string, error) {
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read cloud-init file: %w", err)
+	}
+
+	tmpl, err := template.New("cloud-init").Parse(string(content))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse cloud-init template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("failed to execute cloud-init template: %w", err)
+	}
+
+	return buf.String(), nil
+}
+
+func generateMultipartUserData(userScript string, cloudInitContent string) string {
+	boundary := "MIMEBOUNDARY"
+	var buf bytes.Buffer
+
+	buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + boundary + "\"\n")
+	buf.WriteString("MIME-Version: 1.0\n\n")
+
+	// Part 1: Shell script for user setup
+	buf.WriteString("--" + boundary + "\n")
+	buf.WriteString("Content-Type: text/x-shellscript; charset=\"utf-8\"\n")
+	buf.WriteString("Content-Disposition: attachment; filename=\"setup-users.sh\"\n\n")
+	buf.WriteString(userScript)
+	buf.WriteString("\n")
+
+	// Part 2: Cloud-init config (if provided)
+	if cloudInitContent != "" {
+		buf.WriteString("--" + boundary + "\n")
+		buf.WriteString("Content-Type: text/cloud-config; charset=\"utf-8\"\n")
+		buf.WriteString("Content-Disposition: attachment; filename=\"cloud-config.yaml\"\n\n")
+		buf.WriteString(cloudInitContent)
+		buf.WriteString("\n")
+	}
+
+	buf.WriteString("--" + boundary + "--\n")
+
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func lookupZoneID(ctx context.Context, r53Client *route53.Client, domain string) (string, error) {
@@ -590,15 +682,16 @@ func createStack(stackName string) {
 		log.Fatalf("Invalid DNS configuration: %v", err)
 	}
 
-	// Load AWS config
-	awsCfg, err := config.LoadDefaultConfig(ctx)
+	// Load AWS config with region from JSON config
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(stackCfg.Region))
 	if err != nil {
 		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
-	fmt.Printf("Using AWS Region: %s\n", awsCfg.Region)
+	fmt.Printf("Using AWS Region: %s\n", stackCfg.Region)
 	fmt.Printf("Config File: %s\n", configFile)
 	fmt.Printf("Stack Name: %s\n", stackName)
+	fmt.Printf("OS: %s\n", stackCfg.OS)
 	fmt.Printf("Users to create: %d\n", len(stackCfg.Users))
 	for _, user := range stackCfg.Users {
 		fmt.Printf("  - %s (GitHub: %s)\n", user.Username, user.GitHubUsername)
@@ -607,6 +700,16 @@ func createStack(stackName string) {
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
 	r53Client := route53.NewFromConfig(awsCfg)
+	ssmClient := ssm.NewFromConfig(awsCfg)
+
+	// Lookup AMI ID from SSM
+	fmt.Printf("Looking up AMI for %s...\n", stackCfg.OS)
+	amiID, err := lookupAMI(ctx, ssmClient, stackCfg.OS)
+	if err != nil {
+		log.Fatalf("failed to lookup AMI: %v", err)
+	}
+	fmt.Printf("Found AMI: %s\n", amiID)
+	stackCfg.AMIID = amiID
 
 	// Lookup zone ID if domain is specified
 	var zoneID string
@@ -619,8 +722,42 @@ func createStack(stackName string) {
 		fmt.Printf("Found Zone ID: %s\n", zoneID)
 	}
 
-	// Encode users for CloudFormation parameter
-	usersParam := encodeUsers(stackCfg.Users)
+	// Generate UserData
+	userScript := generateUserSetupScript(stackCfg.Users)
+
+	var cloudInitContent string
+	if stackCfg.CloudInitFile != "" {
+		// Resolve path relative to config file
+		cloudInitPath := stackCfg.CloudInitFile
+		if !filepath.IsAbs(cloudInitPath) {
+			configDir := filepath.Dir(configFile)
+			cloudInitPath = filepath.Join(configDir, cloudInitPath)
+		}
+
+		fmt.Printf("Processing cloud-init file: %s\n", cloudInitPath)
+
+		// Calculate FQDN for template
+		fqdn := ""
+		if stackCfg.Hostname != "" && stackCfg.Domain != "" {
+			fqdn = fmt.Sprintf("%s.%s", stackCfg.Hostname, stackCfg.Domain)
+		}
+
+		templateData := CloudInitTemplateData{
+			Hostname: stackCfg.Hostname,
+			Domain:   stackCfg.Domain,
+			FQDN:     fqdn,
+			Region:   stackCfg.Region,
+			OS:       stackCfg.OS,
+			Users:    stackCfg.Users,
+		}
+
+		cloudInitContent, err = processCloudInitTemplate(cloudInitPath, templateData)
+		if err != nil {
+			log.Fatalf("failed to process cloud-init: %v", err)
+		}
+	}
+
+	userData := generateMultipartUserData(userScript, cloudInitContent)
 
 	// Create CloudFormation stack
 	input := &cloudformation.CreateStackInput{
@@ -628,12 +765,16 @@ func createStack(stackName string) {
 		TemplateBody: aws.String(cloudFormationTemplate),
 		Parameters: []types.Parameter{
 			{
-				ParameterKey:   aws.String("Users"),
-				ParameterValue: aws.String(usersParam),
+				ParameterKey:   aws.String("ImageId"),
+				ParameterValue: aws.String(amiID),
 			},
 			{
 				ParameterKey:   aws.String("InstanceType"),
 				ParameterValue: aws.String(stackCfg.InstanceType),
+			},
+			{
+				ParameterKey:   aws.String("UserData"),
+				ParameterValue: aws.String(userData),
 			},
 		},
 		Capabilities: []types.Capability{
@@ -740,13 +881,19 @@ func deleteStack(stackName string) {
 		configFile = ""
 	}
 
-	// Load AWS config
-	awsCfg, err := config.LoadDefaultConfig(ctx)
+	// Determine region (from config or default)
+	region := "us-east-1"
+	if stackCfg != nil && stackCfg.Region != "" {
+		region = stackCfg.Region
+	}
+
+	// Load AWS config with region from JSON config
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
-	fmt.Printf("Using AWS Region: %s\n", awsCfg.Region)
+	fmt.Printf("Using AWS Region: %s\n", region)
 	fmt.Printf("Deleting Stack: %s\n", stackName)
 
 	cfClient := cloudformation.NewFromConfig(awsCfg)
