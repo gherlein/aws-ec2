@@ -18,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation/types"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	r53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -47,6 +49,8 @@ type StackConfig struct {
 	TTL            int      `json:"ttl,omitempty"`
 	IsApexDomain   bool     `json:"is_apex_domain,omitempty"`
 	CNAMEAliases   []string `json:"cname_aliases,omitempty"`
+	VpcID          string   `json:"vpc_id,omitempty"`
+	SubnetID       string   `json:"subnet_id,omitempty"`
 
 	// Output fields (program fills in)
 	StackName     string      `json:"stack_name,omitempty"`
@@ -60,6 +64,13 @@ type StackConfig struct {
 	FQDN          string      `json:"fqdn,omitempty"`
 	SSHCommand    string      `json:"ssh_command,omitempty"`
 	DNSRecords    []DNSRecord `json:"dns_records,omitempty"`
+
+	// Network resources created by this tool (for cleanup)
+	CreatedVPC            bool   `json:"created_vpc,omitempty"`
+	CreatedSubnet         bool   `json:"created_subnet,omitempty"`
+	InternetGatewayID     string `json:"internet_gateway_id,omitempty"`
+	RouteTableID          string `json:"route_table_id,omitempty"`
+	RouteTableAssociation string `json:"route_table_association_id,omitempty"`
 }
 
 var osSSMPaths = map[string]string{
@@ -87,16 +98,37 @@ Parameters:
   UserData:
     Type: String
     Description: Base64 encoded UserData script
+  VpcId:
+    Type: String
+    Description: VPC ID for the security group
+    Default: ""
+  SubnetId:
+    Type: String
+    Description: Subnet ID for the EC2 instance
+    Default: ""
+
+Conditions:
+  HasVpc: !Not [!Equals [!Ref VpcId, ""]]
+  HasSubnet: !Not [!Equals [!Ref SubnetId, ""]]
 
 Resources:
   SSHSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow SSH inbound traffic
+      VpcId: !If [HasVpc, !Ref VpcId, !Ref "AWS::NoValue"]
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
@@ -107,8 +139,12 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !Ref ImageId
-      SecurityGroupIds:
-        - !GetAtt SSHSecurityGroup.GroupId
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !If [HasSubnet, !Ref SubnetId, !Ref "AWS::NoValue"]
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !GetAtt SSHSecurityGroup.GroupId
       UserData: !Ref UserData
       Tags:
         - Key: Name
@@ -271,6 +307,307 @@ func lookupAMI(ctx context.Context, ssmClient *ssm.Client, osName string) (strin
 	}
 
 	return *result.Parameter.Value, nil
+}
+
+func discoverVPC(ctx context.Context, ec2Client *ec2.Client) (string, error) {
+	// First try to find the default VPC
+	result, err := ec2Client.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("is-default"),
+				Values: []string{"true"},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to describe VPCs: %w", err)
+	}
+
+	if len(result.Vpcs) > 0 {
+		return *result.Vpcs[0].VpcId, nil
+	}
+
+	// No default VPC, get any available VPC
+	result, err = ec2Client.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{})
+	if err != nil {
+		return "", fmt.Errorf("failed to describe VPCs: %w", err)
+	}
+
+	if len(result.Vpcs) == 0 {
+		return "", nil
+	}
+
+	return *result.Vpcs[0].VpcId, nil
+}
+
+func discoverSubnet(ctx context.Context, ec2Client *ec2.Client, vpcID string) (string, error) {
+	// Find a public subnet (one that has MapPublicIpOnLaunch enabled or has a route to IGW)
+	result, err := ec2Client.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("vpc-id"),
+				Values: []string{vpcID},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to describe subnets: %w", err)
+	}
+
+	if len(result.Subnets) == 0 {
+		return "", nil
+	}
+
+	// Prefer subnets that auto-assign public IPs
+	for _, subnet := range result.Subnets {
+		if subnet.MapPublicIpOnLaunch != nil && *subnet.MapPublicIpOnLaunch {
+			return *subnet.SubnetId, nil
+		}
+	}
+
+	// Fall back to first subnet
+	return *result.Subnets[0].SubnetId, nil
+}
+
+type NetworkStack struct {
+	VpcID                 string
+	SubnetID              string
+	InternetGatewayID     string
+	RouteTableID          string
+	RouteTableAssociation string
+}
+
+func createNetworkStack(ctx context.Context, ec2Client *ec2.Client, stackName string) (*NetworkStack, error) {
+	fmt.Println("Creating new VPC and network infrastructure...")
+
+	result := &NetworkStack{}
+
+	// Create VPC
+	vpcOutput, err := ec2Client.CreateVpc(ctx, &ec2.CreateVpcInput{
+		CidrBlock: aws.String("10.0.0.0/16"),
+		TagSpecifications: []ec2types.TagSpecification{
+			{
+				ResourceType: ec2types.ResourceTypeVpc,
+				Tags: []ec2types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("%s-vpc", stackName))},
+					{Key: aws.String("ManagedBy"), Value: aws.String("aws-ec2-tool")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VPC: %w", err)
+	}
+	result.VpcID = *vpcOutput.Vpc.VpcId
+	fmt.Printf("  Created VPC: %s\n", result.VpcID)
+
+	// Wait for VPC to be available
+	vpcWaiter := ec2.NewVpcAvailableWaiter(ec2Client)
+	err = vpcWaiter.Wait(ctx, &ec2.DescribeVpcsInput{
+		VpcIds: []string{result.VpcID},
+	}, 2*time.Minute)
+	if err != nil {
+		return result, fmt.Errorf("VPC not available: %w", err)
+	}
+
+	// Enable DNS hostnames on VPC
+	_, err = ec2Client.ModifyVpcAttribute(ctx, &ec2.ModifyVpcAttributeInput{
+		VpcId:              aws.String(result.VpcID),
+		EnableDnsHostnames: &ec2types.AttributeBooleanValue{Value: aws.Bool(true)},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to enable DNS hostnames: %w", err)
+	}
+
+	// Create Internet Gateway
+	igwOutput, err := ec2Client.CreateInternetGateway(ctx, &ec2.CreateInternetGatewayInput{
+		TagSpecifications: []ec2types.TagSpecification{
+			{
+				ResourceType: ec2types.ResourceTypeInternetGateway,
+				Tags: []ec2types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("%s-igw", stackName))},
+					{Key: aws.String("ManagedBy"), Value: aws.String("aws-ec2-tool")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to create Internet Gateway: %w", err)
+	}
+	result.InternetGatewayID = *igwOutput.InternetGateway.InternetGatewayId
+	fmt.Printf("  Created Internet Gateway: %s\n", result.InternetGatewayID)
+
+	// Attach Internet Gateway to VPC
+	_, err = ec2Client.AttachInternetGateway(ctx, &ec2.AttachInternetGatewayInput{
+		InternetGatewayId: aws.String(result.InternetGatewayID),
+		VpcId:             aws.String(result.VpcID),
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to attach Internet Gateway: %w", err)
+	}
+	fmt.Println("  Attached Internet Gateway to VPC")
+
+	// Get availability zones
+	azOutput, err := ec2Client.DescribeAvailabilityZones(ctx, &ec2.DescribeAvailabilityZonesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("state"),
+				Values: []string{"available"},
+			},
+		},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to get availability zones: %w", err)
+	}
+	if len(azOutput.AvailabilityZones) == 0 {
+		return result, fmt.Errorf("no availability zones found")
+	}
+	az := *azOutput.AvailabilityZones[0].ZoneName
+
+	// Create public subnet
+	subnetOutput, err := ec2Client.CreateSubnet(ctx, &ec2.CreateSubnetInput{
+		VpcId:            aws.String(result.VpcID),
+		CidrBlock:        aws.String("10.0.1.0/24"),
+		AvailabilityZone: aws.String(az),
+		TagSpecifications: []ec2types.TagSpecification{
+			{
+				ResourceType: ec2types.ResourceTypeSubnet,
+				Tags: []ec2types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("%s-public-subnet", stackName))},
+					{Key: aws.String("ManagedBy"), Value: aws.String("aws-ec2-tool")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to create subnet: %w", err)
+	}
+	result.SubnetID = *subnetOutput.Subnet.SubnetId
+	fmt.Printf("  Created Subnet: %s in %s\n", result.SubnetID, az)
+
+	// Enable auto-assign public IP on subnet
+	_, err = ec2Client.ModifySubnetAttribute(ctx, &ec2.ModifySubnetAttributeInput{
+		SubnetId:            aws.String(result.SubnetID),
+		MapPublicIpOnLaunch: &ec2types.AttributeBooleanValue{Value: aws.Bool(true)},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to enable auto-assign public IP: %w", err)
+	}
+
+	// Create route table
+	rtOutput, err := ec2Client.CreateRouteTable(ctx, &ec2.CreateRouteTableInput{
+		VpcId: aws.String(result.VpcID),
+		TagSpecifications: []ec2types.TagSpecification{
+			{
+				ResourceType: ec2types.ResourceTypeRouteTable,
+				Tags: []ec2types.Tag{
+					{Key: aws.String("Name"), Value: aws.String(fmt.Sprintf("%s-public-rt", stackName))},
+					{Key: aws.String("ManagedBy"), Value: aws.String("aws-ec2-tool")},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to create route table: %w", err)
+	}
+	result.RouteTableID = *rtOutput.RouteTable.RouteTableId
+	fmt.Printf("  Created Route Table: %s\n", result.RouteTableID)
+
+	// Add default route to Internet Gateway
+	_, err = ec2Client.CreateRoute(ctx, &ec2.CreateRouteInput{
+		RouteTableId:         aws.String(result.RouteTableID),
+		DestinationCidrBlock: aws.String("0.0.0.0/0"),
+		GatewayId:            aws.String(result.InternetGatewayID),
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to create route: %w", err)
+	}
+	fmt.Println("  Added default route to Internet Gateway")
+
+	// Associate route table with subnet
+	assocOutput, err := ec2Client.AssociateRouteTable(ctx, &ec2.AssociateRouteTableInput{
+		RouteTableId: aws.String(result.RouteTableID),
+		SubnetId:     aws.String(result.SubnetID),
+	})
+	if err != nil {
+		return result, fmt.Errorf("failed to associate route table: %w", err)
+	}
+	result.RouteTableAssociation = *assocOutput.AssociationId
+	fmt.Println("  Associated route table with subnet")
+
+	fmt.Println("Network infrastructure created successfully")
+	return result, nil
+}
+
+func deleteNetworkStack(ctx context.Context, ec2Client *ec2.Client, cfg *StackConfig) {
+	fmt.Println("Deleting created network infrastructure...")
+
+	// Disassociate and delete route table
+	if cfg.RouteTableAssociation != "" {
+		_, err := ec2Client.DisassociateRouteTable(ctx, &ec2.DisassociateRouteTableInput{
+			AssociationId: aws.String(cfg.RouteTableAssociation),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to disassociate route table: %v\n", err)
+		}
+	}
+
+	if cfg.RouteTableID != "" {
+		_, err := ec2Client.DeleteRouteTable(ctx, &ec2.DeleteRouteTableInput{
+			RouteTableId: aws.String(cfg.RouteTableID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete route table: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Route Table: %s\n", cfg.RouteTableID)
+		}
+	}
+
+	// Delete subnet
+	if cfg.CreatedSubnet && cfg.SubnetID != "" {
+		_, err := ec2Client.DeleteSubnet(ctx, &ec2.DeleteSubnetInput{
+			SubnetId: aws.String(cfg.SubnetID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete subnet: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Subnet: %s\n", cfg.SubnetID)
+		}
+	}
+
+	// Detach and delete Internet Gateway
+	if cfg.InternetGatewayID != "" && cfg.VpcID != "" {
+		_, err := ec2Client.DetachInternetGateway(ctx, &ec2.DetachInternetGatewayInput{
+			InternetGatewayId: aws.String(cfg.InternetGatewayID),
+			VpcId:             aws.String(cfg.VpcID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to detach Internet Gateway: %v\n", err)
+		}
+
+		_, err = ec2Client.DeleteInternetGateway(ctx, &ec2.DeleteInternetGatewayInput{
+			InternetGatewayId: aws.String(cfg.InternetGatewayID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete Internet Gateway: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Internet Gateway: %s\n", cfg.InternetGatewayID)
+		}
+	}
+
+	// Delete VPC
+	if cfg.CreatedVPC && cfg.VpcID != "" {
+		_, err := ec2Client.DeleteVpc(ctx, &ec2.DeleteVpcInput{
+			VpcId: aws.String(cfg.VpcID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete VPC: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted VPC: %s\n", cfg.VpcID)
+		}
+	}
+
+	fmt.Println("Network cleanup complete")
 }
 
 func generateUserSetupScript(users []User) string {
@@ -701,6 +1038,63 @@ func createStack(stackName string) {
 	cfClient := cloudformation.NewFromConfig(awsCfg)
 	r53Client := route53.NewFromConfig(awsCfg)
 	ssmClient := ssm.NewFromConfig(awsCfg)
+	ec2Client := ec2.NewFromConfig(awsCfg)
+
+	// Discover or create VPC and Subnet
+	if stackCfg.VpcID == "" {
+		fmt.Println("Discovering VPC...")
+		vpcID, err := discoverVPC(ctx, ec2Client)
+		if err != nil {
+			log.Fatalf("failed to discover VPC: %v", err)
+		}
+
+		if vpcID == "" {
+			// No VPC found, create full network stack
+			netStack, err := createNetworkStack(ctx, ec2Client, stackName)
+			if err != nil {
+				log.Fatalf("failed to create network stack: %v", err)
+			}
+			stackCfg.VpcID = netStack.VpcID
+			stackCfg.SubnetID = netStack.SubnetID
+			stackCfg.InternetGatewayID = netStack.InternetGatewayID
+			stackCfg.RouteTableID = netStack.RouteTableID
+			stackCfg.RouteTableAssociation = netStack.RouteTableAssociation
+			stackCfg.CreatedVPC = true
+			stackCfg.CreatedSubnet = true
+		} else {
+			stackCfg.VpcID = vpcID
+			fmt.Printf("Using existing VPC: %s\n", vpcID)
+		}
+	}
+
+	if stackCfg.SubnetID == "" {
+		fmt.Println("Discovering subnet...")
+		subnetID, err := discoverSubnet(ctx, ec2Client, stackCfg.VpcID)
+		if err != nil {
+			log.Fatalf("failed to discover subnet: %v", err)
+		}
+
+		if subnetID == "" {
+			// No suitable subnet found, create one
+			netStack, err := createNetworkStack(ctx, ec2Client, stackName)
+			if err != nil {
+				log.Fatalf("failed to create network stack: %v", err)
+			}
+			// Update with newly created resources
+			if stackCfg.VpcID == "" {
+				stackCfg.VpcID = netStack.VpcID
+				stackCfg.CreatedVPC = true
+			}
+			stackCfg.SubnetID = netStack.SubnetID
+			stackCfg.InternetGatewayID = netStack.InternetGatewayID
+			stackCfg.RouteTableID = netStack.RouteTableID
+			stackCfg.RouteTableAssociation = netStack.RouteTableAssociation
+			stackCfg.CreatedSubnet = true
+		} else {
+			stackCfg.SubnetID = subnetID
+			fmt.Printf("Using existing Subnet: %s\n", subnetID)
+		}
+	}
 
 	// Lookup AMI ID from SSM
 	fmt.Printf("Looking up AMI for %s...\n", stackCfg.OS)
@@ -775,6 +1169,14 @@ func createStack(stackName string) {
 			{
 				ParameterKey:   aws.String("UserData"),
 				ParameterValue: aws.String(userData),
+			},
+			{
+				ParameterKey:   aws.String("VpcId"),
+				ParameterValue: aws.String(stackCfg.VpcID),
+			},
+			{
+				ParameterKey:   aws.String("SubnetId"),
+				ParameterValue: aws.String(stackCfg.SubnetID),
 			},
 		},
 		Capabilities: []types.Capability{
@@ -938,11 +1340,16 @@ func deleteStack(stackName string) {
 		log.Fatalf("failed waiting for stack deletion: %v", err)
 	}
 
-	// Clear output fields in config file
+	// Delete created network infrastructure
+	if stackCfg != nil && (stackCfg.CreatedVPC || stackCfg.CreatedSubnet || stackCfg.InternetGatewayID != "") {
+		ec2Client := ec2.NewFromConfig(awsCfg)
+		deleteNetworkStack(ctx, ec2Client, stackCfg)
+	}
+
+	// Clear output fields in config file (preserve input fields like Region)
 	if stackCfg != nil && configFile != "" {
 		stackCfg.StackName = ""
 		stackCfg.StackID = ""
-		stackCfg.Region = ""
 		stackCfg.InstanceID = ""
 		stackCfg.PublicIP = ""
 		stackCfg.SecurityGroup = ""
@@ -950,6 +1357,13 @@ func deleteStack(stackName string) {
 		stackCfg.FQDN = ""
 		stackCfg.SSHCommand = ""
 		stackCfg.DNSRecords = []DNSRecord{}
+		stackCfg.CreatedVPC = false
+		stackCfg.CreatedSubnet = false
+		stackCfg.VpcID = ""
+		stackCfg.SubnetID = ""
+		stackCfg.InternetGatewayID = ""
+		stackCfg.RouteTableID = ""
+		stackCfg.RouteTableAssociation = ""
 		if err := writeConfig(configFile, stackCfg); err != nil {
 			log.Printf("Warning: failed to update config file: %v", err)
 		} else {
