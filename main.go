@@ -100,23 +100,17 @@ Parameters:
     Description: Base64 encoded UserData script
   VpcId:
     Type: String
-    Description: VPC ID for the security group
-    Default: ""
+    Description: VPC ID for the security group (required)
   SubnetId:
     Type: String
-    Description: Subnet ID for the EC2 instance
-    Default: ""
-
-Conditions:
-  HasVpc: !Not [!Equals [!Ref VpcId, ""]]
-  HasSubnet: !Not [!Equals [!Ref SubnetId, ""]]
+    Description: Subnet ID for the EC2 instance (required)
 
 Resources:
   SSHSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow SSH inbound traffic
-      VpcId: !If [HasVpc, !Ref VpcId, !Ref "AWS::NoValue"]
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
@@ -132,7 +126,7 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: SSHAccess
+          Value: !Sub "${AWS::StackName}-sg"
 
   EC2Instance:
     Type: AWS::EC2::Instance
@@ -141,7 +135,7 @@ Resources:
       ImageId: !Ref ImageId
       NetworkInterfaces:
         - DeviceIndex: "0"
-          SubnetId: !If [HasSubnet, !Ref SubnetId, !Ref "AWS::NoValue"]
+          SubnetId: !Ref SubnetId
           AssociatePublicIpAddress: true
           GroupSet:
             - !GetAtt SSHSecurityGroup.GroupId
@@ -163,6 +157,12 @@ Outputs:
   SecurityGroupId:
     Description: Security Group ID
     Value: !Ref SSHSecurityGroup
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VpcId
+  SubnetId:
+    Description: Subnet ID
+    Value: !Ref SubnetId
 `
 
 func main() {
@@ -1094,6 +1094,14 @@ func createStack(stackName string) {
 			stackCfg.SubnetID = subnetID
 			fmt.Printf("Using existing Subnet: %s\n", subnetID)
 		}
+	}
+
+	// Validate VPC and Subnet are available (required for CloudFormation)
+	if stackCfg.VpcID == "" {
+		log.Fatal("VPC ID is required but could not be discovered or created")
+	}
+	if stackCfg.SubnetID == "" {
+		log.Fatal("Subnet ID is required but could not be discovered or created")
 	}
 
 	// Lookup AMI ID from SSM
