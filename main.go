@@ -183,8 +183,18 @@ func main() {
 		name = *stackNameShort
 	}
 
+	// If no -n flag, check for positional argument (config file path)
+	if name == "" && flag.NArg() > 0 {
+		configPath := flag.Arg(0)
+		// Extract stack name from filename (remove path and .json extension)
+		name = strings.TrimSuffix(configPath, ".json")
+		if lastSlash := strings.LastIndex(name, "/"); lastSlash >= 0 {
+			name = name[lastSlash+1:]
+		}
+	}
+
 	if name == "" {
-		log.Fatal("Stack name required (-n <name>)")
+		log.Fatal("Stack name required: use -n <name> or provide a config file path")
 	}
 
 	if !doCreate && !doDelete {
