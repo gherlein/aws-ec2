@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,6 +184,22 @@ func generateCloudFormationTemplate(userData string) (string, error) {
 	}
 
 	return buf.String(), nil
+}
+
+func generateRandomHostname() string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	const length = 8
+	result := make([]byte, length)
+
+	for i := range result {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			log.Fatalf("failed to generate random hostname: %v", err)
+		}
+		result[i] = charset[num.Int64()]
+	}
+
+	return string(result)
 }
 
 func main() {
@@ -638,8 +656,9 @@ func generateUserSetupScript(users []User) string {
 	for _, user := range users {
 		script.WriteString(fmt.Sprintf("\n# Create user: %s (GitHub: %s)\n", user.Username, user.GitHubUsername))
 		script.WriteString(fmt.Sprintf("useradd -m -s /bin/bash %q || true\n", user.Username))
-		script.WriteString(fmt.Sprintf("usermod -a -G www-data %s\n", user.Username))
-		script.WriteString(fmt.Sprintf("echo %q ' ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/%s\n", user.Username, user.Username))
+		script.WriteString(fmt.Sprintf("usermod -a -G sudo,www-data %s\n", user.Username))
+		script.WriteString(fmt.Sprintf("echo '%s ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/%s\n", user.Username, user.Username))
+		script.WriteString(fmt.Sprintf("chmod 0440 /etc/sudoers.d/%s\n", user.Username))
 		script.WriteString(fmt.Sprintf("mkdir -p /home/%s/.ssh\n", user.Username))
 		script.WriteString(fmt.Sprintf("chmod 700 /home/%s/.ssh\n", user.Username))
 		script.WriteString(fmt.Sprintf("curl -s https://github.com/%s.keys > /home/%s/.ssh/authorized_keys\n", user.GitHubUsername, user.Username))
@@ -652,14 +671,16 @@ func generateUserSetupScript(users []User) string {
 }
 
 type CloudInitTemplateData struct {
-	Hostname   string
-	Domain     string
-	FQDN       string
-	Region     string
-	OS         string
-	WorkingDir string
-	Packages   []string
-	Users      []User
+	Hostname      string
+	Domain        string
+	FQDN          string
+	Region        string
+	OS            string
+	WorkingDir    string
+	Packages      []string
+	Users         []User
+	IsApexDomain  bool
+	CNAMEAliases  []string
 }
 
 func processCloudInitTemplate(templatePath string, data CloudInitTemplateData) (string, error) {
@@ -1031,6 +1052,17 @@ func createStack(stackName string) {
 		log.Fatalf("Error: %v", err)
 	}
 
+	// Generate random hostname if not specified (helps avoid Let's Encrypt rate limits)
+	if stackCfg.Hostname == "" && stackCfg.Domain != "" {
+		stackCfg.Hostname = generateRandomHostname()
+		fmt.Printf("Generated random hostname: %s\n", stackCfg.Hostname)
+
+		// Save the generated hostname back to config
+		if err := writeConfig(configFile, stackCfg); err != nil {
+			log.Fatalf("failed to save generated hostname to config: %v", err)
+		}
+	}
+
 	// Validate user configuration
 	if err := validateUserConfig(stackCfg); err != nil {
 		log.Fatalf("Invalid user configuration: %v", err)
@@ -1173,14 +1205,16 @@ func createStack(stackName string) {
 		}
 
 		templateData := CloudInitTemplateData{
-			Hostname:   stackCfg.Hostname,
-			Domain:     stackCfg.Domain,
-			FQDN:       fqdn,
-			Region:     stackCfg.Region,
-			OS:         stackCfg.OS,
-			WorkingDir: workingDir,
-			Packages:   stackCfg.Packages,
-			Users:      stackCfg.Users,
+			Hostname:     stackCfg.Hostname,
+			Domain:       stackCfg.Domain,
+			FQDN:         fqdn,
+			Region:       stackCfg.Region,
+			OS:           stackCfg.OS,
+			WorkingDir:   workingDir,
+			Packages:     stackCfg.Packages,
+			Users:        stackCfg.Users,
+			IsApexDomain: stackCfg.IsApexDomain,
+			CNAMEAliases: stackCfg.CNAMEAliases,
 		}
 
 		cloudInitContent, err = processCloudInitTemplate(cloudInitPath, templateData)

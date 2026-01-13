@@ -11,6 +11,7 @@ A Go CLI tool to create and manage EC2 instances on AWS using CloudFormation, wi
 - **CloudFormation**: Uses CloudFormation for reliable, repeatable infrastructure
 - **JSON config**: Simple JSON configuration files for each stack
 - **Clean teardown**: Deletes DNS records and CloudFormation stack, clears config
+- **Basic authentication**: Optional cloud-init templates include HTTP basic auth for web access
 
 ## Prerequisites
 
@@ -135,6 +136,20 @@ Set your GitHub username and optionally configure DNS:
 }
 ```
 
+**Tip:** Leave `hostname` empty to auto-generate a random 8-character hostname. This helps avoid Let's Encrypt rate limits during rapid testing:
+
+```json
+{
+  "github_username": "your-github-username",
+  "instance_type": "t3.micro",
+  "hostname": "",
+  "domain": "example.com",
+  "ttl": 300
+}
+```
+
+The tool will generate something like `a7k3m9xz.example.com` and save it to the config.
+
 ### 3. Create the instance
 
 ```bash
@@ -149,7 +164,17 @@ The tool automatically looks for `stacks/myserver.json` first. If not found, it 
 ssh your-github-username@myserver.example.com
 ```
 
-### 5. Delete when done
+### 5. Access the web interface (if using cloud-init/webserver.yaml)
+
+The webserver is configured with HTTP Basic Authentication:
+
+- **URL**: `https://myserver.example.com`
+- **Username**: `emerging`
+- **Password**: `emerging2026`
+
+Your browser will prompt for credentials when you access the site.
+
+### 6. Delete when done
 
 ```bash
 ./bin/ec2 -d -n myserver
@@ -353,7 +378,8 @@ STACK_NAME=myserver make status
 2. **Security Group**: Creates a security group allowing inbound SSH (port 22) from `0.0.0.0/0`
 3. **UserData Script**: Runs on first boot to:
    - Create a Linux user matching your GitHub username
-   - Grant passwordless sudo access
+   - Add user to `sudo` and `www-data` groups
+   - Grant passwordless sudo access via `/etc/sudoers.d/`
    - Fetch SSH public keys from `https://github.com/<username>.keys`
    - Configure SSH authorized_keys
 
@@ -363,6 +389,29 @@ If `hostname` and `domain` are specified:
 1. Looks up the Route53 hosted zone ID for the domain
 2. Creates an A record: `<hostname>.<domain>` → `<public_ip>`
 3. On deletion, removes the A record before deleting the stack
+
+**Random Hostname Generation:**
+
+If `hostname` is empty but `domain` is specified, the tool automatically generates a random 8-character hostname:
+- Uses cryptographically secure random generation
+- Characters: `a-z` and `0-9` (DNS-safe)
+- Saves the generated hostname back to the config file
+- Helps avoid Let's Encrypt rate limits during rapid create/delete cycles
+
+Example workflow:
+```json
+{
+  "hostname": "",
+  "domain": "example.com"
+}
+```
+
+Creates: `x3k9m2a7.example.com`
+
+This is useful for:
+- Testing and development iterations
+- Avoiding Let's Encrypt's 5 certificates per domain per week limit
+- Quick throwaway instances
 
 ## Troubleshooting
 
@@ -411,8 +460,19 @@ Or in the AWS console: CloudFormation → Stacks → Select stack → Events tab
 ## Security Considerations
 
 - **SSH Access**: The security group allows SSH from `0.0.0.0/0` (anywhere). For production, consider restricting to specific IP ranges.
-- **Sudo Access**: The created user has passwordless sudo. This is convenient for development but may not be appropriate for all use cases.
+- **Sudo Access**:
+  - Users are added to the `sudo` group
+  - Passwordless sudo is configured via `/etc/sudoers.d/<username>` with proper permissions (0440)
+  - This provides `ALL=(ALL) NOPASSWD:ALL` access
+  - Convenient for development/testing but consider restricting for production
+- **Group Memberships**: Users are automatically added to:
+  - `sudo` - Full administrative access
+  - `www-data` - Web content deployment access
 - **Public Keys**: SSH keys are fetched from GitHub over HTTPS. Ensure your GitHub account security is adequate.
+- **Basic Authentication** (webserver cloud-init):
+  - Default credentials: `emerging` / `emerging2026`
+  - Change the password in `cloud-init/webserver.yaml` before deployment
+  - For production, use stronger passwords and consider certificate-based auth
 
 ## Files
 

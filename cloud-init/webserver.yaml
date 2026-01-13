@@ -23,30 +23,8 @@ users:
   - name: caddy
     system: true
     shell: /usr/sbin/nologin
-    home: /var/lib/caddy
 
 write_files:
-  - path: /etc/caddy/Caddyfile
-    content: |
-      {{.FQDN}} {
-        root * {{.WorkingDir}}
-        file_server
-        encode gzip
-
-        log {
-          output file /var/log/caddy/access.log
-          format json
-        }
-
-        header {
-          X-Content-Type-Options "nosniff"
-          X-Frame-Options "DENY"
-          Referrer-Policy "no-referrer-when-downgrade"
-        }
-      }
-    owner: caddy:caddy
-    permissions: '0644'
-
   - path: {{.WorkingDir}}/index.html
     content: |
       <!DOCTYPE html>
@@ -103,6 +81,10 @@ write_files:
       Web root: {{.WorkingDir}}
       Caddy logs: /var/log/caddy/
 
+      Basic Authentication:
+        Username: emerging
+        Password: emerging2026
+
       Useful commands:
         sudo systemctl status caddy
         sudo journalctl -u caddy -f
@@ -123,16 +105,47 @@ runcmd:
   - mkdir -p {{.WorkingDir}}
   - mkdir -p /var/log/caddy
   - mkdir -p /var/lib/caddy
+  - mkdir -p /home/caddy/.local/share/caddy
+  - mkdir -p /home/caddy/.config/caddy
 
   # Set ownership
   - chown -R caddy:caddy /var/lib/caddy
   - chown -R caddy:caddy /var/log/caddy
+  - chown -R caddy:caddy /home/caddy
   - chown -R www-data:www-data {{.WorkingDir}}
   - chmod 2775 {{.WorkingDir}}
 
   # Ensure Caddy config directory exists
   - mkdir -p /etc/caddy
   - chown -R caddy:caddy /etc/caddy
+
+  # Write Caddyfile with basic authentication (after Caddy installation to prevent overwrite)
+  - |
+    HASH=$(caddy hash-password --plaintext 'emerging2026')
+    cat > /etc/caddy/Caddyfile << EOF
+    {{.FQDN}}{{if .IsApexDomain}}, {{.Domain}}{{end}}{{range .CNAMEAliases}}, {{.}}.{{$.Domain}}{{end}} {
+      basicauth {
+        emerging $HASH
+      }
+
+      root * {{.WorkingDir}}
+      file_server
+      encode gzip
+
+      log {
+        output file /var/log/caddy/access.log
+        format json
+      }
+
+      header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer-when-downgrade"
+      }
+    }
+    EOF
+  - chown caddy:caddy /etc/caddy/Caddyfile
+  - chmod 0644 /etc/caddy/Caddyfile
 
   # Enable and start Caddy
   - systemctl daemon-reload

@@ -1,0 +1,20 @@
+{
+  "region": "us-east-1",
+  "os": "ubuntu-22.04",
+  "cloud_init_file": "cloud-init/webserver.yaml",
+  "working_dir": "/var/www/html",
+  "packages": [
+    "htop",
+    "net-tools"
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "github_username": "gherlein"
+    }
+  ],
+  "instance_type": "t3.micro",
+  "hostname": "",
+  "domain": "example.com",
+  "ttl": 300
+}

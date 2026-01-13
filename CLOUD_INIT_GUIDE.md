@@ -90,6 +90,7 @@ Add `cloud_init_file`, `working_dir`, and `packages` to your stack config:
 **New Fields:**
 - `working_dir` (optional): Base directory for file deployments. Defaults to `/var/www/html` if not specified.
 - `packages` (optional): Array of package names to install via apt-get. These are installed in addition to base packages in cloud-init.
+- `hostname` (optional): Hostname for DNS. If empty and `domain` is specified, a random 8-character hostname is generated automatically.
 
 ### Path Resolution
 
@@ -118,12 +119,13 @@ See the included `cloud-init/webserver.yaml` for a complete Caddy webserver setu
 - Creates `caddy` system user
 - Installs Caddy from official repo
 - Configures Caddyfile with HTTPS
+- Enables HTTP Basic Authentication (username: `emerging`, password: `emerging2026`)
 - Sets up web root at `/var/www/html`
 - Adds all users to `www-data` group for deployment access
 - Sets `/var/www/html` permissions to 775 (group writable)
 - Creates welcome page with server info
 - Configures logging
-- Adds MOTD banner
+- Adds MOTD banner with credentials
 
 **Config:** `example-webserver.json`
 
@@ -324,21 +326,26 @@ runcmd:
 
 ### Modifying Users Created by Shell Script
 
-Users are created by the shell script before cloud-init runs. Use templates to modify them:
+Users are created by the shell script before cloud-init runs with:
+- **Groups**: `sudo` and `www-data` (pre-configured)
+- **Sudo Access**: NOPASSWD:ALL via `/etc/sudoers.d/<username>` (0440 permissions)
+
+Use templates to add users to additional groups:
 
 ```yaml
 runcmd:
-  # Add all users to a group
+  # Add all users to Docker group
 {{range .Users}}
   - usermod -a -G docker {{.Username}}
-  - usermod -a -G www-data {{.Username}}
 {{end}}
 ```
 
+**Note:** Users already have `sudo` and `www-data` group membership from the shell script.
+
 This is useful for:
-- Adding users to deployment groups (www-data)
 - Adding users to Docker group
-- Setting up application-specific permissions
+- Adding users to application-specific groups
+- Setting up service-specific permissions
 
 ### Networking
 

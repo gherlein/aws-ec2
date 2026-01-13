@@ -287,7 +287,17 @@ Use `example-single-user.json` with your preferred username and GitHub account.
 ### Pattern 4: Quick Temporary Instance
 Use `example-no-dns.json` for fast provisioning without DNS setup.
 
-### Pattern 5: Multi-Environment Server
+### Pattern 5: Random Hostname for Testing
+Use `example-random-hostname.json` with empty hostname to avoid Let's Encrypt rate limits:
+```json
+{
+  "hostname": "",
+  "domain": "example.com"
+}
+```
+The tool generates a unique 8-character hostname like `k3m9x2a7.example.com` automatically. Perfect for rapid create/delete testing cycles.
+
+### Pattern 6: Multi-Environment Server
 Use CNAMEs to create logical names:
 ```json
 {
