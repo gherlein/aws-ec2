@@ -1,0 +1,10 @@
+{
+  "dns": {
+    "target_ip": "203.0.113.10",
+    "hostname": "app",
+    "domain": "example.com",
+    "ttl": 300,
+    "is_apex_domain": true,
+    "cname_aliases": ["www", "api"]
+  }
+}

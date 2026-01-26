@@ -39,6 +39,54 @@ type DNSRecord struct {
 	TTL   int    `json:"ttl"`
 }
 
+// New nested configuration structure
+type Config struct {
+	VM  *VMConfig  `json:"vm,omitempty"`
+	DNS *DNSConfig `json:"dns,omitempty"`
+}
+
+type VMConfig struct {
+	Region        string   `json:"region,omitempty"`
+	OS            string   `json:"os,omitempty"`
+	InstanceType  string   `json:"instance_type,omitempty"`
+	CloudInitFile string   `json:"cloud_init_file,omitempty"`
+	WorkingDir    string   `json:"working_dir,omitempty"`
+	Packages      []string `json:"packages,omitempty"`
+	Users         []User   `json:"users,omitempty"`
+	VpcID         string   `json:"vpc_id,omitempty"`
+	SubnetID      string   `json:"subnet_id,omitempty"`
+
+	// Output fields
+	StackName     string `json:"stack_name,omitempty"`
+	StackID       string `json:"stack_id,omitempty"`
+	InstanceID    string `json:"instance_id,omitempty"`
+	PublicIP      string `json:"public_ip,omitempty"`
+	SecurityGroup string `json:"security_group,omitempty"`
+	AMIID         string `json:"ami_id,omitempty"`
+
+	// Network resources for cleanup
+	CreatedVPC            bool   `json:"created_vpc,omitempty"`
+	CreatedSubnet         bool   `json:"created_subnet,omitempty"`
+	InternetGatewayID     string `json:"internet_gateway_id,omitempty"`
+	RouteTableID          string `json:"route_table_id,omitempty"`
+	RouteTableAssociation string `json:"route_table_association_id,omitempty"`
+}
+
+type DNSConfig struct {
+	Hostname     string   `json:"hostname,omitempty"`
+	Domain       string   `json:"domain,omitempty"`
+	TTL          int      `json:"ttl,omitempty"`
+	IsApexDomain bool     `json:"is_apex_domain,omitempty"`
+	CNAMEAliases []string `json:"cname_aliases,omitempty"`
+	TargetIP     string   `json:"target_ip,omitempty"`
+
+	// Output fields
+	ZoneID     string      `json:"zone_id,omitempty"`
+	FQDN       string      `json:"fqdn,omitempty"`
+	DNSRecords []DNSRecord `json:"dns_records,omitempty"`
+}
+
+// Legacy flat configuration structure (kept for backward compatibility)
 type StackConfig struct {
 	// Input fields (user provides)
 	GitHubUsername string   `json:"github_username,omitempty"`
@@ -269,9 +317,9 @@ func main() {
 	}
 
 	if doCreate {
-		createStack(name)
+		createStackNested(name)
 	} else if doDelete {
-		deleteStack(name)
+		deleteStackNested(name)
 	}
 }
 
@@ -324,6 +372,118 @@ func writeConfig(filename string, cfg *StackConfig) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return os.WriteFile(filename, data, 0644)
+}
+
+func readNestedConfig(stackName string) (*Config, string, error) {
+	filename := resolveConfigPath(stackName)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, filename, fmt.Errorf("failed to read config file %s: %w", filename, err)
+	}
+
+	// Try nested format first
+	var config Config
+	if err := json.Unmarshal(data, &config); err == nil {
+		if config.VM != nil || config.DNS != nil {
+			// Apply defaults
+			applyConfigDefaults(&config)
+			return &config, filename, nil
+		}
+	}
+
+	// Fall back to flat format for backward compatibility
+	var flatConfig StackConfig
+	if err := json.Unmarshal(data, &flatConfig); err != nil {
+		return nil, filename, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	fmt.Println("Note: Using legacy flat config format (still supported)")
+	config = *convertFlatToNested(&flatConfig)
+	applyConfigDefaults(&config)
+	return &config, filename, nil
+}
+
+func writeNestedConfig(filename string, config *Config) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(filename, data, 0644)
+}
+
+func convertFlatToNested(flat *StackConfig) *Config {
+	config := &Config{}
+
+	// Determine if we have VM configuration
+	hasVM := len(flat.Users) > 0 || flat.GitHubUsername != "" || flat.InstanceType != ""
+
+	// Create VM section if we have VM-related fields
+	if hasVM {
+		config.VM = &VMConfig{
+			Region:                flat.Region,
+			OS:                    flat.OS,
+			InstanceType:          flat.InstanceType,
+			CloudInitFile:         flat.CloudInitFile,
+			WorkingDir:            flat.WorkingDir,
+			Packages:              flat.Packages,
+			Users:                 flat.Users,
+			VpcID:                 flat.VpcID,
+			SubnetID:              flat.SubnetID,
+			StackName:             flat.StackName,
+			StackID:               flat.StackID,
+			InstanceID:            flat.InstanceID,
+			PublicIP:              flat.PublicIP,
+			SecurityGroup:         flat.SecurityGroup,
+			AMIID:                 flat.AMIID,
+			CreatedVPC:            flat.CreatedVPC,
+			CreatedSubnet:         flat.CreatedSubnet,
+			InternetGatewayID:     flat.InternetGatewayID,
+			RouteTableID:          flat.RouteTableID,
+			RouteTableAssociation: flat.RouteTableAssociation,
+		}
+
+		// Handle legacy github_username field
+		if flat.GitHubUsername != "" && len(flat.Users) == 0 {
+			config.VM.Users = []User{{Username: flat.GitHubUsername, GitHubUsername: flat.GitHubUsername}}
+		}
+	}
+
+	// Create DNS section if we have DNS-related fields
+	if flat.Domain != "" {
+		config.DNS = &DNSConfig{
+			Hostname:     flat.Hostname,
+			Domain:       flat.Domain,
+			TTL:          flat.TTL,
+			IsApexDomain: flat.IsApexDomain,
+			CNAMEAliases: flat.CNAMEAliases,
+			TargetIP:     flat.PublicIP, // Use PublicIP from VM if present
+			ZoneID:       flat.ZoneID,
+			FQDN:         flat.FQDN,
+			DNSRecords:   flat.DNSRecords,
+		}
+	}
+
+	return config
+}
+
+func applyConfigDefaults(config *Config) {
+	if config.VM != nil {
+		if config.VM.Region == "" {
+			config.VM.Region = "us-east-1"
+		}
+		if config.VM.OS == "" {
+			config.VM.OS = "ubuntu-22.04"
+		}
+		if config.VM.InstanceType == "" {
+			config.VM.InstanceType = "t3.micro"
+		}
+	}
+
+	if config.DNS != nil {
+		if config.DNS.TTL == 0 {
+			config.DNS.TTL = 300
+		}
+	}
 }
 
 func lookupAMI(ctx context.Context, ssmClient *ssm.Client, osName string) (string, error) {
@@ -1041,6 +1201,617 @@ func createDNSRecords(ctx context.Context, r53Client *route53.Client, cfg *Stack
 	}
 
 	return createdRecords, nil
+}
+
+// createVMResources creates EC2 instance and returns public IP and region
+func createVMResources(ctx context.Context, vm *VMConfig, stackName string) (string, string, error) {
+	// Load AWS config with region from VM config
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(vm.Region))
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	fmt.Printf("Using AWS Region: %s\n", vm.Region)
+	fmt.Printf("Stack Name: %s\n", stackName)
+	fmt.Printf("OS: %s\n", vm.OS)
+	fmt.Printf("Users to create: %d\n", len(vm.Users))
+	for _, user := range vm.Users {
+		fmt.Printf("  - %s (GitHub: %s)\n", user.Username, user.GitHubUsername)
+	}
+	fmt.Printf("Instance Type: %s\n", vm.InstanceType)
+
+	cfClient := cloudformation.NewFromConfig(awsCfg)
+	ssmClient := ssm.NewFromConfig(awsCfg)
+	ec2Client := ec2.NewFromConfig(awsCfg)
+
+	// Discover or create VPC and Subnet
+	if vm.VpcID == "" {
+		fmt.Println("Discovering VPC...")
+		vpcID, err := discoverVPC(ctx, ec2Client)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to discover VPC: %w", err)
+		}
+
+		if vpcID == "" {
+			// No VPC found, create full network stack
+			netStack, err := createNetworkStack(ctx, ec2Client, stackName)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to create network stack: %w", err)
+			}
+			vm.VpcID = netStack.VpcID
+			vm.SubnetID = netStack.SubnetID
+			vm.InternetGatewayID = netStack.InternetGatewayID
+			vm.RouteTableID = netStack.RouteTableID
+			vm.RouteTableAssociation = netStack.RouteTableAssociation
+			vm.CreatedVPC = true
+			vm.CreatedSubnet = true
+		} else {
+			vm.VpcID = vpcID
+			fmt.Printf("Using existing VPC: %s\n", vpcID)
+		}
+	}
+
+	if vm.SubnetID == "" {
+		fmt.Println("Discovering subnet...")
+		subnetID, err := discoverSubnet(ctx, ec2Client, vm.VpcID)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to discover subnet: %w", err)
+		}
+
+		if subnetID == "" {
+			// No suitable subnet found, create one
+			netStack, err := createNetworkStack(ctx, ec2Client, stackName)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to create network stack: %w", err)
+			}
+			// Update with newly created resources
+			if vm.VpcID == "" {
+				vm.VpcID = netStack.VpcID
+				vm.CreatedVPC = true
+			}
+			vm.SubnetID = netStack.SubnetID
+			vm.InternetGatewayID = netStack.InternetGatewayID
+			vm.RouteTableID = netStack.RouteTableID
+			vm.RouteTableAssociation = netStack.RouteTableAssociation
+			vm.CreatedSubnet = true
+		} else {
+			vm.SubnetID = subnetID
+			fmt.Printf("Using existing Subnet: %s\n", subnetID)
+		}
+	}
+
+	// Validate VPC and Subnet are available
+	if vm.VpcID == "" {
+		return "", "", fmt.Errorf("VPC ID is required but could not be discovered or created")
+	}
+	if vm.SubnetID == "" {
+		return "", "", fmt.Errorf("Subnet ID is required but could not be discovered or created")
+	}
+
+	// Lookup AMI ID from SSM
+	fmt.Printf("Looking up AMI for %s...\n", vm.OS)
+	amiID, err := lookupAMI(ctx, ssmClient, vm.OS)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to lookup AMI: %w", err)
+	}
+	fmt.Printf("Found AMI: %s\n", amiID)
+	vm.AMIID = amiID
+
+	// Generate UserData
+	userScript := generateUserSetupScript(vm.Users)
+
+	var cloudInitContent string
+	if vm.CloudInitFile != "" {
+		// Resolve path relative to current directory
+		cloudInitPath := vm.CloudInitFile
+		if !filepath.IsAbs(cloudInitPath) {
+			cwd, _ := os.Getwd()
+			cloudInitPath = filepath.Join(cwd, cloudInitPath)
+		}
+
+		fmt.Printf("Processing cloud-init file: %s\n", cloudInitPath)
+
+		// Default working directory
+		workingDir := vm.WorkingDir
+		if workingDir == "" {
+			workingDir = "/var/www/html"
+		}
+
+		templateData := CloudInitTemplateData{
+			Region:     vm.Region,
+			OS:         vm.OS,
+			WorkingDir: workingDir,
+			Packages:   vm.Packages,
+			Users:      vm.Users,
+		}
+
+		cloudInitContent, err = processCloudInitTemplate(cloudInitPath, templateData)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to process cloud-init: %w", err)
+		}
+	}
+
+	userData := generateMultipartUserData(userScript, cloudInitContent)
+
+	// Generate CloudFormation template with embedded UserData
+	cfnTemplate, err := generateCloudFormationTemplate(userData)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate CloudFormation template: %w", err)
+	}
+
+	// Create CloudFormation stack
+	input := &cloudformation.CreateStackInput{
+		StackName:    aws.String(stackName),
+		TemplateBody: aws.String(cfnTemplate),
+		Parameters: []types.Parameter{
+			{
+				ParameterKey:   aws.String("ImageId"),
+				ParameterValue: aws.String(amiID),
+			},
+			{
+				ParameterKey:   aws.String("InstanceType"),
+				ParameterValue: aws.String(vm.InstanceType),
+			},
+			{
+				ParameterKey:   aws.String("VpcId"),
+				ParameterValue: aws.String(vm.VpcID),
+			},
+			{
+				ParameterKey:   aws.String("SubnetId"),
+				ParameterValue: aws.String(vm.SubnetID),
+			},
+		},
+		Capabilities: []types.Capability{
+			types.CapabilityCapabilityIam,
+		},
+		Tags: []types.Tag{
+			{
+				Key:   aws.String("Purpose"),
+				Value: aws.String("EC2Instance"),
+			},
+		},
+	}
+
+	result, err := cfClient.CreateStack(ctx, input)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create stack: %w", err)
+	}
+
+	fmt.Printf("Stack creation initiated!\n")
+	fmt.Printf("Stack ID: %s\n", *result.StackId)
+	fmt.Printf("Waiting for stack to complete...\n")
+
+	waiter := cloudformation.NewStackCreateCompleteWaiter(cfClient)
+	err = waiter.Wait(ctx, &cloudformation.DescribeStacksInput{
+		StackName: aws.String(stackName),
+	}, 10*time.Minute)
+	if err != nil {
+		return "", "", fmt.Errorf("failed waiting for stack: %w", err)
+	}
+
+	// Get stack outputs
+	describeOutput, err := cfClient.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
+		StackName: aws.String(stackName),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to describe stack: %w", err)
+	}
+
+	// Update VM config with outputs
+	vm.StackName = stackName
+	vm.StackID = *result.StackId
+
+	for _, output := range describeOutput.Stacks[0].Outputs {
+		switch *output.OutputKey {
+		case "InstanceId":
+			vm.InstanceID = *output.OutputValue
+		case "InstanceType":
+			vm.InstanceType = *output.OutputValue
+		case "PublicIP":
+			vm.PublicIP = *output.OutputValue
+		case "SecurityGroupId":
+			vm.SecurityGroup = *output.OutputValue
+		}
+	}
+
+	return vm.PublicIP, vm.Region, nil
+}
+
+// createDNSResources creates DNS records and returns created records
+func createDNSResources(ctx context.Context, dns *DNSConfig, publicIP, region string) error {
+	// Load AWS config with region
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	r53Client := route53.NewFromConfig(awsCfg)
+
+	// Lookup zone ID
+	fmt.Printf("Looking up zone ID for %s...\n", dns.Domain)
+	zoneID, err := lookupZoneID(ctx, r53Client, dns.Domain)
+	if err != nil {
+		return fmt.Errorf("failed to lookup zone ID: %w", err)
+	}
+	fmt.Printf("Found Zone ID: %s\n", zoneID)
+	dns.ZoneID = zoneID
+
+	// Determine target IP
+	targetIP := publicIP
+	if dns.TargetIP != "" {
+		targetIP = dns.TargetIP
+	}
+
+	var createdRecords []DNSRecord
+
+	// 1. Create primary A record (hostname.domain -> IP)
+	if dns.Hostname != "" {
+		fqdn := fmt.Sprintf("%s.%s", dns.Hostname, dns.Domain)
+		err := createARecord(ctx, r53Client, dns.ZoneID, fqdn, targetIP, dns.TTL)
+		if err != nil {
+			return fmt.Errorf("failed to create primary A record: %w", err)
+		}
+		createdRecords = append(createdRecords, DNSRecord{
+			Name:  fqdn,
+			Type:  "A",
+			Value: targetIP,
+			TTL:   dns.TTL,
+		})
+		dns.FQDN = fqdn
+	}
+
+	// 2. Create CNAME records (alias.domain -> hostname.domain)
+	if dns.Hostname != "" && len(dns.CNAMEAliases) > 0 {
+		targetFQDN := fmt.Sprintf("%s.%s", dns.Hostname, dns.Domain)
+		for _, alias := range dns.CNAMEAliases {
+			aliasFQDN := fmt.Sprintf("%s.%s", alias, dns.Domain)
+			err := createCNAMERecord(ctx, r53Client, dns.ZoneID, aliasFQDN, targetFQDN, dns.TTL)
+			if err != nil {
+				deleteCreatedRecords(ctx, r53Client, dns.ZoneID, createdRecords)
+				return fmt.Errorf("failed to create CNAME %s: %w", aliasFQDN, err)
+			}
+			createdRecords = append(createdRecords, DNSRecord{
+				Name:  aliasFQDN,
+				Type:  "CNAME",
+				Value: targetFQDN,
+				TTL:   dns.TTL,
+			})
+		}
+	}
+
+	// 3. Create apex A record (domain -> IP)
+	if dns.IsApexDomain {
+		err := createARecord(ctx, r53Client, dns.ZoneID, dns.Domain, targetIP, dns.TTL)
+		if err != nil {
+			deleteCreatedRecords(ctx, r53Client, dns.ZoneID, createdRecords)
+			return fmt.Errorf("failed to create apex A record: %w", err)
+		}
+		createdRecords = append(createdRecords, DNSRecord{
+			Name:  dns.Domain,
+			Type:  "A",
+			Value: targetIP,
+			TTL:   dns.TTL,
+		})
+		if dns.FQDN == "" {
+			dns.FQDN = dns.Domain
+		}
+	}
+
+	fmt.Printf("Created %d DNS record(s) successfully\n", len(createdRecords))
+	dns.DNSRecords = createdRecords
+
+	return nil
+}
+
+// createStackNested creates stack using nested config structure
+func createStackNested(stackName string) {
+	ctx := context.Background()
+
+	// Read nested config
+	cfg, configFile, err := readNestedConfig(stackName)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+
+	// Validate config
+	if cfg.VM == nil && cfg.DNS == nil {
+		log.Fatal("Config must have at least one of 'vm' or 'dns' sections")
+	}
+
+	// Validate VM users if VM section exists
+	if cfg.VM != nil {
+		if len(cfg.VM.Users) == 0 {
+			log.Fatal("VM section requires at least one user in 'users' array")
+		}
+		// Validate each user
+		seen := make(map[string]bool)
+		for i, user := range cfg.VM.Users {
+			if user.Username == "" {
+				log.Fatalf("vm.users[%d]: username cannot be empty", i)
+			}
+			if user.GitHubUsername == "" {
+				log.Fatalf("vm.users[%d]: github_username cannot be empty", i)
+			}
+			if seen[user.Username] {
+				log.Fatalf("duplicate username: %s", user.Username)
+			}
+			seen[user.Username] = true
+			if !isValidLinuxUsername(user.Username) {
+				log.Fatalf("invalid username format: %s (must be lowercase alphanumeric, start with letter)", user.Username)
+			}
+		}
+	}
+
+	// Validate DNS config if DNS section exists
+	if cfg.DNS != nil {
+		if len(cfg.DNS.CNAMEAliases) > 0 {
+			if cfg.DNS.Hostname == "" || cfg.DNS.Domain == "" {
+				log.Fatal("cname_aliases requires both hostname and domain")
+			}
+			seen := make(map[string]bool)
+			for _, alias := range cfg.DNS.CNAMEAliases {
+				if alias == "" {
+					log.Fatal("cname_aliases cannot contain empty strings")
+				}
+				if alias == cfg.DNS.Hostname {
+					log.Fatalf("cname_aliases cannot duplicate primary hostname: %s", alias)
+				}
+				if seen[alias] {
+					log.Fatalf("duplicate cname_alias: %s", alias)
+				}
+				seen[alias] = true
+			}
+		}
+		if cfg.DNS.IsApexDomain && cfg.DNS.Domain == "" {
+			log.Fatal("is_apex_domain requires domain to be specified")
+		}
+	}
+
+	// Generate random hostname if DNS section exists but hostname is empty
+	if cfg.DNS != nil && cfg.DNS.Hostname == "" && cfg.DNS.Domain != "" {
+		cfg.DNS.Hostname = generateRandomHostname()
+		fmt.Printf("Generated random hostname: %s\n", cfg.DNS.Hostname)
+	}
+
+	fmt.Printf("Config File: %s\n", configFile)
+
+	var publicIP string
+	var region string
+
+	// Create VM resources if configured
+	if cfg.VM != nil {
+		fmt.Println("\n=== Creating VM Resources ===")
+		publicIP, region, err = createVMResources(ctx, cfg.VM, stackName)
+		if err != nil {
+			log.Fatalf("Failed to create VM resources: %v", err)
+		}
+		fmt.Printf("\nVM Created Successfully\n")
+		fmt.Printf("Public IP: %s\n", publicIP)
+	}
+
+	// Create DNS resources if configured
+	if cfg.DNS != nil {
+		fmt.Println("\n=== Creating DNS Resources ===")
+
+		// Use region from VM if available, otherwise default
+		if region == "" {
+			region = "us-east-1"
+		}
+
+		// Use publicIP from VM if no target_ip specified
+		if cfg.DNS.TargetIP == "" && publicIP != "" {
+			cfg.DNS.TargetIP = publicIP
+		}
+
+		err = createDNSResources(ctx, cfg.DNS, publicIP, region)
+		if err != nil {
+			log.Fatalf("Failed to create DNS resources: %v", err)
+		}
+		fmt.Printf("\nDNS Created Successfully\n")
+		fmt.Printf("FQDN: %s\n", cfg.DNS.FQDN)
+	}
+
+	// Write updated config
+	if err := writeNestedConfig(configFile, cfg); err != nil {
+		log.Printf("Warning: failed to write config: %v", err)
+	}
+
+	// Print summary
+	fmt.Printf("\n=== Stack Created Successfully ===\n")
+	jsonData, _ := json.MarshalIndent(cfg, "", "  ")
+	fmt.Println(string(jsonData))
+	fmt.Printf("\nConfig updated: %s\n", configFile)
+
+	// Print SSH command if VM was created
+	if cfg.VM != nil && len(cfg.VM.Users) > 0 {
+		sshTarget := cfg.VM.PublicIP
+		if cfg.DNS != nil && cfg.DNS.FQDN != "" {
+			sshTarget = cfg.DNS.FQDN
+		}
+		fmt.Printf("SSH: ssh %s@%s\n", cfg.VM.Users[0].Username, sshTarget)
+	}
+}
+
+// deleteNetworkStackNested deletes network stack using nested VM config
+func deleteNetworkStackNested(ctx context.Context, ec2Client *ec2.Client, vm *VMConfig) {
+	fmt.Println("Deleting created network infrastructure...")
+
+	// Disassociate and delete route table
+	if vm.RouteTableAssociation != "" {
+		_, err := ec2Client.DisassociateRouteTable(ctx, &ec2.DisassociateRouteTableInput{
+			AssociationId: aws.String(vm.RouteTableAssociation),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to disassociate route table: %v\n", err)
+		}
+	}
+
+	if vm.RouteTableID != "" {
+		_, err := ec2Client.DeleteRouteTable(ctx, &ec2.DeleteRouteTableInput{
+			RouteTableId: aws.String(vm.RouteTableID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete route table: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Route Table: %s\n", vm.RouteTableID)
+		}
+	}
+
+	// Delete subnet
+	if vm.CreatedSubnet && vm.SubnetID != "" {
+		_, err := ec2Client.DeleteSubnet(ctx, &ec2.DeleteSubnetInput{
+			SubnetId: aws.String(vm.SubnetID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete subnet: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Subnet: %s\n", vm.SubnetID)
+		}
+	}
+
+	// Detach and delete Internet Gateway
+	if vm.InternetGatewayID != "" && vm.VpcID != "" {
+		_, err := ec2Client.DetachInternetGateway(ctx, &ec2.DetachInternetGatewayInput{
+			InternetGatewayId: aws.String(vm.InternetGatewayID),
+			VpcId:             aws.String(vm.VpcID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to detach Internet Gateway: %v\n", err)
+		}
+
+		_, err = ec2Client.DeleteInternetGateway(ctx, &ec2.DeleteInternetGatewayInput{
+			InternetGatewayId: aws.String(vm.InternetGatewayID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete Internet Gateway: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted Internet Gateway: %s\n", vm.InternetGatewayID)
+		}
+	}
+
+	// Delete VPC
+	if vm.CreatedVPC && vm.VpcID != "" {
+		_, err := ec2Client.DeleteVpc(ctx, &ec2.DeleteVpcInput{
+			VpcId: aws.String(vm.VpcID),
+		})
+		if err != nil {
+			fmt.Printf("  Warning: failed to delete VPC: %v\n", err)
+		} else {
+			fmt.Printf("  Deleted VPC: %s\n", vm.VpcID)
+		}
+	}
+
+	fmt.Println("Network cleanup complete")
+}
+
+// deleteStackNested deletes stack using nested config structure
+func deleteStackNested(stackName string) {
+	ctx := context.Background()
+
+	// Read nested config
+	cfg, configFile, err := readNestedConfig(stackName)
+	if err != nil {
+		fmt.Printf("Warning: could not read config file: %v\n", err)
+		cfg = nil
+		configFile = ""
+	}
+
+	// Determine region
+	region := "us-east-1"
+	if cfg != nil && cfg.VM != nil && cfg.VM.Region != "" {
+		region = cfg.VM.Region
+	}
+
+	// Load AWS config
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		log.Fatalf("failed to load AWS config: %v", err)
+	}
+
+	fmt.Printf("Using AWS Region: %s\n", region)
+	fmt.Printf("Deleting Stack: %s\n", stackName)
+
+	// Delete DNS records first (if configured)
+	if cfg != nil && cfg.DNS != nil && cfg.DNS.ZoneID != "" && len(cfg.DNS.DNSRecords) > 0 {
+		fmt.Printf("Deleting %d DNS record(s)...\n", len(cfg.DNS.DNSRecords))
+		r53Client := route53.NewFromConfig(awsCfg)
+
+		for _, record := range cfg.DNS.DNSRecords {
+			fmt.Printf("  Deleting %s record: %s -> %s\n", record.Type, record.Name, record.Value)
+
+			var err error
+			if record.Type == "A" {
+				err = deleteARecord(ctx, r53Client, cfg.DNS.ZoneID, record.Name, record.Value, record.TTL)
+			} else if record.Type == "CNAME" {
+				err = deleteCNAMERecord(ctx, r53Client, cfg.DNS.ZoneID, record.Name, record.Value, record.TTL)
+			}
+
+			if err != nil {
+				log.Printf("Warning: failed to delete DNS record %s: %v", record.Name, err)
+			}
+		}
+		fmt.Println("DNS records deleted")
+	}
+
+	// Delete CloudFormation stack (if VM configured)
+	if cfg != nil && cfg.VM != nil && cfg.VM.StackName != "" {
+		cfClient := cloudformation.NewFromConfig(awsCfg)
+
+		_, err = cfClient.DeleteStack(ctx, &cloudformation.DeleteStackInput{
+			StackName: aws.String(stackName),
+		})
+		if err != nil {
+			log.Fatalf("failed to delete stack: %v", err)
+		}
+
+		fmt.Println("Stack deletion initiated, waiting for completion...")
+
+		waiter := cloudformation.NewStackDeleteCompleteWaiter(cfClient)
+		err = waiter.Wait(ctx, &cloudformation.DescribeStacksInput{
+			StackName: aws.String(stackName),
+		}, 10*time.Minute)
+		if err != nil {
+			log.Fatalf("failed waiting for stack deletion: %v", err)
+		}
+
+		// Delete created network infrastructure
+		if cfg.VM.CreatedVPC || cfg.VM.CreatedSubnet || cfg.VM.InternetGatewayID != "" {
+			ec2Client := ec2.NewFromConfig(awsCfg)
+			deleteNetworkStackNested(ctx, ec2Client, cfg.VM)
+		}
+	}
+
+	// Clear output fields in config file
+	if cfg != nil && configFile != "" {
+		if cfg.VM != nil {
+			cfg.VM.StackName = ""
+			cfg.VM.StackID = ""
+			cfg.VM.InstanceID = ""
+			cfg.VM.PublicIP = ""
+			cfg.VM.SecurityGroup = ""
+			cfg.VM.AMIID = ""
+			cfg.VM.CreatedVPC = false
+			cfg.VM.CreatedSubnet = false
+			cfg.VM.VpcID = ""
+			cfg.VM.SubnetID = ""
+			cfg.VM.InternetGatewayID = ""
+			cfg.VM.RouteTableID = ""
+			cfg.VM.RouteTableAssociation = ""
+		}
+		if cfg.DNS != nil {
+			cfg.DNS.ZoneID = ""
+			cfg.DNS.FQDN = ""
+			cfg.DNS.DNSRecords = []DNSRecord{}
+		}
+
+		if err := writeNestedConfig(configFile, cfg); err != nil {
+			log.Printf("Warning: failed to update config file: %v", err)
+		} else {
+			fmt.Printf("Config cleared: %s\n", configFile)
+		}
+	}
+
+	fmt.Println("Stack deleted successfully")
 }
 
 func createStack(stackName string) {

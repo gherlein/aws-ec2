@@ -5,6 +5,8 @@ A Go CLI tool to create and manage EC2 instances on AWS using CloudFormation, wi
 ## Features
 
 - **One-command provisioning**: Create a fully configured EC2 instance with a single command
+- **DNS-only mode**: Manage Route53 DNS records for any infrastructure (no EC2 required)
+- **Flexible configuration**: VM-only, DNS-only, or combined modes via nested config structure
 - **GitHub SSH keys**: Automatically fetches your public SSH keys from GitHub
 - **User creation**: Creates a Linux user matching your GitHub username with passwordless sudo
 - **Route53 DNS**: Optionally creates an A record pointing to your instance
@@ -103,11 +105,31 @@ Your AWS user/role needs the following permissions:
 
 ```bash
 git clone <repository>
-cd aws
+cd aws-ec2
 make build
 ```
 
 The binary will be placed in `./bin/ec2`.
+
+### Installing to Your PATH
+
+To install the binary to a directory in your PATH:
+
+```bash
+make install
+```
+
+This installs to `~/bin` by default. To install to a different location:
+
+```bash
+make install INSTALL_DIR=~/aaa
+```
+
+Make sure the target directory is in your PATH. To add `~/bin` to your PATH, add this to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export PATH="$HOME/bin:$PATH"
+```
 
 ## Quick Start
 
@@ -179,6 +201,103 @@ Your browser will prompt for credentials when you access the site.
 ```bash
 ./bin/ec2 -d -n myserver
 ```
+
+## DNS-Only Mode (New!)
+
+Manage Route53 DNS records for any infrastructure without creating EC2 instances.
+
+### Quick DNS-Only Example
+
+```bash
+# Create DNS config for external server
+cat > stacks/external.json << 'EOF'
+{
+  "dns": {
+    "target_ip": "203.0.113.10",
+    "hostname": "app",
+    "domain": "example.com",
+    "is_apex_domain": true,
+    "cname_aliases": ["www"]
+  }
+}
+EOF
+
+# Create DNS records
+./bin/ec2 -c -n external
+
+# Delete when done
+./bin/ec2 -d -n external
+```
+
+**Creates:**
+- A: `app.example.com → 203.0.113.10`
+- A: `example.com → 203.0.113.10`
+- CNAME: `www.example.com → app.example.com`
+
+**Use cases:**
+- Point domains to DigitalOcean, Linode, Hetzner, etc.
+- Manage DNS for existing EC2 instances
+- Quick DNS setup for testing
+- Load balancer or CDN configurations
+
+**See [DNS_ONLY_GUIDE.md](DNS_ONLY_GUIDE.md) for complete documentation.**
+
+## Configuration Modes
+
+The tool supports three modes via nested configuration structure:
+
+### 1. Full Stack (VM + DNS)
+
+```json
+{
+  "vm": {
+    "users": [{"username": "admin", "github_username": "gherlein"}]
+  },
+  "dns": {
+    "hostname": "app",
+    "domain": "example.com"
+  }
+}
+```
+
+Creates EC2 instance and DNS records (DNS uses VM's IP automatically).
+
+### 2. DNS-Only
+
+```json
+{
+  "dns": {
+    "target_ip": "203.0.113.10",
+    "domain": "example.com"
+  }
+}
+```
+
+Creates DNS records only (no EC2).
+
+### 3. VM-Only
+
+```json
+{
+  "vm": {
+    "users": [{"username": "admin", "github_username": "gherlein"}]
+  }
+}
+```
+
+Creates EC2 instance only (no DNS, access via IP).
+
+### Legacy Flat Format (Still Supported)
+
+```json
+{
+  "users": [...],
+  "hostname": "dev",
+  "domain": "example.com"
+}
+```
+
+Automatically converted to nested format internally.
 
 ## Configuration
 
@@ -359,9 +478,17 @@ The following x86 instance types are free-tier eligible (750 hours/month for 12 
 ## Makefile Targets
 
 ```bash
-make build    # Build the binary to ./bin/ec2
-make clean    # Remove the bin directory
-make status   # Check CloudFormation stack events (requires STACK_NAME env var)
+make build                       # Build the binary to ./bin/ec2
+make install                     # Build and install to ~/bin (or specify INSTALL_DIR=path)
+make clean                       # Remove the bin directory
+make status                      # Check CloudFormation stack events (requires STACK_NAME env var)
+```
+
+### Install to Custom Directory
+
+```bash
+make install INSTALL_DIR=/usr/local/bin    # Install to /usr/local/bin
+make install INSTALL_DIR=~/my-tools        # Install to custom directory
 ```
 
 ### Check Stack Status

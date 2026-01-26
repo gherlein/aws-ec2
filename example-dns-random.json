@@ -1,0 +1,8 @@
+{
+  "dns": {
+    "target_ip": "198.51.100.5",
+    "hostname": "",
+    "domain": "example.com",
+    "ttl": 300
+  }
+}

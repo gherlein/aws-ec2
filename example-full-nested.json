@@ -1,0 +1,23 @@
+{
+  "vm": {
+    "region": "us-east-1",
+    "os": "ubuntu-22.04",
+    "instance_type": "t3.micro",
+    "cloud_init_file": "cloud-init/webserver.yaml",
+    "working_dir": "/var/www/html",
+    "packages": ["htop", "tree", "net-tools"],
+    "users": [
+      {
+        "username": "admin",
+        "github_username": "gherlein"
+      }
+    ]
+  },
+  "dns": {
+    "hostname": "app",
+    "domain": "example.com",
+    "ttl": 300,
+    "is_apex_domain": true,
+    "cname_aliases": ["www", "api"]
+  }
+}
